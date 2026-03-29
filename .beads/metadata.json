@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "sherlock",
+  "project_id": "60474cb7-bed0-4305-aca4-6087305f4f15"
+}
