@@ -1,9 +1,27 @@
 # Sherlock
 
-Have you ever asked Claude Code to “write a plan for this” and watched your usage melt down?  
+**Claude token-usage forensics for understanding what's driving your spend.**
+
+Have you ever asked Claude Code to "write a plan for this" and watched your usage melt down?  
 That happened to me one too many times, so I built Sherlock to investigate what was really driving token spikes (spoiler: agents).
 
 Use Sherlock to analyze your token usage, see which prompts are actually effective, and spot plugins or workflows that burn money without adding value.
+
+## Repository Scope
+
+**In scope:**
+- Sherlock CLI runtime (ingest, report, TUI)
+- Token attribution and forensics for Claude usage
+- Session analysis and comparison features
+- Documentation and issue tracking for Sherlock roadmap
+- Visualizations for token usage patterns
+
+**Out of scope:**
+- Forge/daemon runtime concerns from legacy monorepo
+- Unrelated plugin orchestration features
+- Non-Sherlock tooling and experiments
+
+This repository is dedicated to Sherlock's core mission: helping you understand and optimize your Claude token usage.
 
 ## Requirements
 
