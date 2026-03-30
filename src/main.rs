@@ -323,6 +323,7 @@ struct SessionReport {
     prompt_stats: PromptStats,
     top_sources: Vec<SourceFact>,
     plugin_sources: Vec<SourceFact>,
+    sources_without_tokens: Vec<SourceFact>,
     spikes: Vec<SpikeFact>,
     comparisons: ComparisonFacts,
     findings: Vec<Finding>,
@@ -762,6 +763,12 @@ fn summarize_session(store: &SherlockStore, session_id: &str) -> Result<Value> {
         .take(10)
         .cloned()
         .collect::<Vec<_>>();
+    let sources_without_tokens = enriched_sources
+        .iter()
+        .filter(|source| source.event_count > 0 && source.estimated_tokens == 0)
+        .take(10)
+        .cloned()
+        .collect::<Vec<_>>();
     let spikes = spike_context(store, session_id)?;
     let comparisons = session_comparison(store, &get_str(session, "project_root"), session_id, 3)?;
     let facts = ReportFacts {
@@ -797,6 +804,7 @@ fn summarize_session(store: &SherlockStore, session_id: &str) -> Result<Value> {
         prompt_stats,
         top_sources,
         plugin_sources,
+        sources_without_tokens,
         spikes,
         comparisons,
         findings,
@@ -1198,6 +1206,32 @@ fn findings_from_facts(facts: &ReportFacts) -> Vec<Finding> {
             ),
         });
     }
+    
+    // Check if sources have events but no token attribution
+    let sources_with_events_but_no_tokens = facts
+        .all_sources
+        .iter()
+        .filter(|s| s.event_count > 0 && s.estimated_tokens == 0)
+        .count();
+    
+    if sources_with_events_but_no_tokens > 0 && totals.total_tokens > 0 {
+        let sources_with_tokens = facts
+            .all_sources
+            .iter()
+            .filter(|s| s.estimated_tokens > 0)
+            .count();
+        findings.push(Finding {
+            id: "sources-missing-token-attribution".to_string(),
+            severity: "medium".to_string(),
+            title: "Some sources have events but no token attribution.".to_string(),
+            detail: format!(
+                "{} sources ({} events) lack token attribution while {} sources have tokens. This may indicate events without usage metadata or attribution gaps in the ingestion logic.",
+                sources_with_events_but_no_tokens,
+                facts.all_sources.iter().filter(|s| s.event_count > 0 && s.estimated_tokens == 0).map(|s| s.event_count).sum::<i64>(),
+                sources_with_tokens
+            ),
+        });
+    }
 
     findings
 }
@@ -1241,6 +1275,12 @@ fn recommendations_from_findings(findings: &[Finding]) -> Vec<Recommendation> {
                 priority: "medium".to_string(),
                 summary: "Re-ingest from richer Claude project logs if available.".to_string(),
                 detail: "The current artifact did not expose token growth, so attribution quality will improve only if the source history includes cumulative usage data.".to_string(),
+            }),
+            "sources-missing-token-attribution" => recommendations.push(Recommendation {
+                id: "check-attribution-logic".to_string(),
+                priority: "medium".to_string(),
+                summary: "Compare event-based metrics when token attribution is incomplete.".to_string(),
+                detail: "For sources without token data, use event counts and payload sizes as proxy metrics. Consider enriching logs with per-event token metadata or implementing more sophisticated attribution heuristics.".to_string(),
             }),
             _ => {}
         }
@@ -2476,7 +2516,8 @@ mod tests {
         assert!(finding_ids.contains(&"oversized-continuation-summary".to_string()));
         assert!(finding_ids.contains(&"workflow-heavy-session".to_string()));
         assert!(finding_ids.contains(&"low-prompt-count-high-usage".to_string()));
-        let recommendation_ids = recommendations_from_facts(&facts)
+        let findings = findings_from_facts(&facts);
+        let recommendation_ids = recommendations_from_findings(&findings)
             .into_iter()
             .map(|recommendation| recommendation.id)
             .collect::<Vec<_>>();
