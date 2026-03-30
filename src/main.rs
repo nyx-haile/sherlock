@@ -373,6 +373,10 @@ struct PromptRecord {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    
+    // Warn about running dolt servers that could be affected
+    check_for_dolt_servers();
+    
     fs::create_dir_all(&cli.repo)?;
     let store = SherlockStore::new(cli.repo);
 
@@ -2458,6 +2462,25 @@ fn git_branch(cwd: &Path) -> Option<String> {
 fn default_repo() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
         .join(".local/share/sherlock")
+}
+
+fn check_for_dolt_servers() {
+    // Check for running dolt sql-server processes
+    let output = Command::new("pgrep")
+        .args(["-f", "dolt sql-server"])
+        .output();
+    
+    if let Ok(out) = output {
+        if out.status.success() && !out.stdout.is_empty() {
+            // Found running servers
+            eprintln!("⚠️  WARNING: Detected running 'dolt sql-server' processes.");
+            eprintln!("   Sherlock uses dolt CLI commands which may temporarily interfere with these servers.");
+            eprintln!("   If you experience issues with beads or other dolt-based tools, try:");
+            eprintln!("   1. Complete your sherlock operation quickly");
+            eprintln!("   2. Or stop dolt servers temporarily while using sherlock");
+            eprintln!();
+        }
+    }
 }
 
 fn default_history() -> PathBuf {

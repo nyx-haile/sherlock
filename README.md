@@ -7,6 +7,15 @@ That happened to me one too many times, so I built Sherlock to investigate what 
 
 Use Sherlock to analyze your token usage, see which prompts are actually effective, and spot plugins or workflows that burn money without adding value.
 
+## Important Note on Dolt Interference
+
+**Sherlock uses Dolt CLI commands which may interfere with running `dolt sql-server` processes** (like those used by beads). When Sherlock detects running Dolt servers, it will display a warning.
+
+**Recommendation:** If you use beads or other Dolt-based tools:
+- Complete your Sherlock operations quickly, or
+- Temporarily stop Dolt servers while using Sherlock
+- This interference is temporary and only occurs while Sherlock is actively running commands
+
 ## Repository Scope
 
 **In scope:**
