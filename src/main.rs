@@ -35,6 +35,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     model_family TEXT
 );
 
+CREATE TABLE IF NOT EXISTS session_aliases (
+    alias VARCHAR(128) PRIMARY KEY,
+    session_id VARCHAR(64) NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS snapshots (
     snapshot_id VARCHAR(64) PRIMARY KEY,
     captured_at TEXT NOT NULL,
@@ -121,6 +128,7 @@ CREATE INDEX IF NOT EXISTS idx_turns_session_index ON turns(session_id, turn_ind
 CREATE INDEX IF NOT EXISTS idx_windows_session_time ON windows(session_id, start_time, end_time);
 CREATE INDEX IF NOT EXISTS idx_attributions_window_score ON attributions(window_id, score DESC);
 CREATE INDEX IF NOT EXISTS idx_sources_fingerprint ON sources(fingerprint);
+CREATE INDEX IF NOT EXISTS idx_session_aliases_session ON session_aliases(session_id);
 "#;
 
 #[derive(Parser)]
@@ -162,6 +170,20 @@ enum Cmd {
     Tui {
         #[arg(long)]
         session_id: Option<String>,
+    },
+    /// List all session aliases
+    ListAliases,
+    /// Set or update an alias for a session
+    SetAlias {
+        /// Human-friendly alias name
+        alias: String,
+        /// Session ID to alias
+        session_id: String,
+    },
+    /// Remove an alias
+    RemoveAlias {
+        /// Alias to remove
+        alias: String,
     },
 }
 
@@ -415,6 +437,45 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             run_tui(&store, &sid)?;
+        }
+        Cmd::ListAliases => {
+            let rows = store.query_rows("SELECT alias, session_id, updated_at FROM session_aliases ORDER BY updated_at DESC")?;
+            if rows.is_empty() {
+                println!("No aliases defined.");
+            } else {
+                println!("Session Aliases:");
+                for row in rows {
+                    println!("  {} -> {}", get_str(&row, "alias"), get_str(&row, "session_id"));
+                }
+            }
+        }
+        Cmd::SetAlias { alias, session_id } => {
+            // Resolve session_id if it's also an alias
+            let resolved_sid = resolve_session_or_alias(&store, &session_id)?;
+            
+            // Check if session exists
+            let check = store.query_rows(&format!(
+                "SELECT session_id FROM sessions WHERE session_id='{}'",
+                sql(&resolved_sid)
+            ))?;
+            if check.is_empty() {
+                return Err(anyhow!("Session not found: {}", resolved_sid));
+            }
+            
+            let now = iso_now();
+            store.exec_script(&format!(
+                "INSERT INTO session_aliases(alias, session_id, created_at, updated_at) VALUES ('{}','{}','{}','{}') \
+                 ON DUPLICATE KEY UPDATE session_id='{}', updated_at='{}'",
+                sql(&alias), sql(&resolved_sid), sql(&now), sql(&now), sql(&resolved_sid), sql(&now)
+            ))?;
+            println!("✓ Alias '{}' -> '{}'", alias, resolved_sid);
+        }
+        Cmd::RemoveAlias { alias } => {
+            store.exec_script(&format!(
+                "DELETE FROM session_aliases WHERE alias='{}'",
+                sql(&alias)
+            ))?;
+            println!("✓ Removed alias '{}'", alias);
         }
     }
 
@@ -1681,9 +1742,23 @@ fn pct(part: i64, total: i64) -> f64 {
     }
 }
 
+fn resolve_session_or_alias(store: &SherlockStore, session_or_alias: &str) -> Result<String> {
+    // First try as alias
+    let rows = store.query_rows(&format!(
+        "SELECT session_id FROM session_aliases WHERE alias='{}'",
+        sql(session_or_alias)
+    ))?;
+    if let Some(row) = rows.first() {
+        return Ok(get_str(row, "session_id"));
+    }
+    // If not found as alias, return as-is (assume it's a session_id)
+    Ok(session_or_alias.to_string())
+}
+
 fn resolve_session_id(store: &SherlockStore, session_id: Option<String>) -> Result<String> {
     if let Some(sid) = session_id {
-        return Ok(sid);
+        // Resolve alias if provided
+        return resolve_session_or_alias(store, &sid);
     }
     let rows =
         store.query_rows("SELECT session_id FROM sessions ORDER BY ended_at DESC LIMIT 1")?;
