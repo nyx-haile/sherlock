@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode},
@@ -17,6 +17,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{stdout, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -155,11 +156,20 @@ enum Cmd {
     Report {
         #[arg(long)]
         session_id: Option<String>,
+        #[arg(long, value_enum, default_value_t = ReportFormat::Json)]
+        format: ReportFormat,
     },
     Tui {
         #[arg(long)]
         session_id: Option<String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum ReportFormat {
+    Json,
+    Markdown,
+    Text,
 }
 
 #[derive(Serialize)]
@@ -170,6 +180,172 @@ struct IngestSummary {
     turns: usize,
     sources: usize,
     windows: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct SessionTotals {
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    total_tokens: i64,
+    cache_read_pct: f64,
+    cache_write_pct: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct PromptExcerpt {
+    timestamp: String,
+    prompt_kind: String,
+    chars: usize,
+    excerpt: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct ContinuationSummaryStats {
+    count: usize,
+    total_chars: usize,
+    average_chars: f64,
+    max_chars: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct PromptStats {
+    prompt_count: usize,
+    total_prompt_chars: usize,
+    average_prompt_chars: f64,
+    longest_prompts: Vec<PromptExcerpt>,
+    continuation_summaries: ContinuationSummaryStats,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct SourceFact {
+    source_id: String,
+    source_kind: String,
+    plugin_id: String,
+    tool_name: String,
+    hook_name: String,
+    event_count: i64,
+    estimated_tokens: i64,
+    estimated_pct: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct LabelCount {
+    label: String,
+    count: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct NearbyEvent {
+    turn_index: i64,
+    event_time: String,
+    event_type: String,
+    tool_name: String,
+    plugin_id: String,
+    hook_name: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct SpikeContext {
+    top_tools: Vec<LabelCount>,
+    top_event_types: Vec<LabelCount>,
+    nearby_events: Vec<NearbyEvent>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct SpikeFact {
+    start_time: String,
+    end_time: String,
+    reason: String,
+    delta_tokens: i64,
+    context: SpikeContext,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct ComparisonSession {
+    session_id: String,
+    ended_at: String,
+    total_tokens: i64,
+    prompt_count: usize,
+    total_prompt_chars: usize,
+    cache_read_tokens: i64,
+    cache_read_pct: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct ComparisonDelta {
+    total_tokens: f64,
+    total_tokens_pct: f64,
+    prompt_count: f64,
+    total_prompt_chars: f64,
+    cache_read_tokens: f64,
+    cache_read_pct_points: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct ComparisonFacts {
+    project_root: String,
+    compared_session_count: usize,
+    recent_sessions: Vec<ComparisonSession>,
+    delta_from_recent_average: Option<ComparisonDelta>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct Finding {
+    id: String,
+    severity: String,
+    title: String,
+    detail: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct Recommendation {
+    id: String,
+    priority: String,
+    summary: String,
+    detail: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct SessionReport {
+    session_id: String,
+    started_at: String,
+    ended_at: String,
+    project_root: String,
+    branch: String,
+    model_family: String,
+    turns: i64,
+    events: i64,
+    windows: i64,
+    totals: SessionTotals,
+    session_totals: SessionTotals,
+    prompt_stats: PromptStats,
+    top_sources: Vec<SourceFact>,
+    plugin_sources: Vec<SourceFact>,
+    spikes: Vec<SpikeFact>,
+    comparisons: ComparisonFacts,
+    findings: Vec<Finding>,
+    recommendations: Vec<Recommendation>,
+    insights: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReportFacts {
+    session_totals: SessionTotals,
+    prompt_stats: PromptStats,
+    all_sources: Vec<SourceFact>,
+    top_sources: Vec<SourceFact>,
+    plugin_sources: Vec<SourceFact>,
+    spikes: Vec<SpikeFact>,
+    comparisons: ComparisonFacts,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PromptRecord {
+    timestamp: String,
+    text: String,
+    is_continuation_summary: bool,
 }
 
 fn main() -> Result<()> {
@@ -183,7 +359,10 @@ fn main() -> Result<()> {
             if commit {
                 store.commit("sherlock: initialize schema")?;
             }
-            println!("{}", json!({"ok": true, "repo": store.repo.display().to_string()}));
+            println!(
+                "{}",
+                json!({"ok": true, "repo": store.repo.display().to_string()})
+            );
         }
         Cmd::Ingest {
             history,
@@ -197,17 +376,27 @@ fn main() -> Result<()> {
             let effective_history = resolve_history_path(history, &project_root)?;
             let sid = resolve_ingest_session_id(&effective_history, session_id)?;
             let b = branch.unwrap_or_else(|| git_branch(&project_root).unwrap_or_default());
-            let summary =
-                ingest_session(&store, &effective_history, &sid, &project_root, &b, &model_family)?;
+            let summary = ingest_session(
+                &store,
+                &effective_history,
+                &sid,
+                &project_root,
+                &b,
+                &model_family,
+            )?;
             if commit {
-                store.commit(&format!("sherlock: ingest {} events={}", sid, summary.events))?;
+                store.commit(&format!(
+                    "sherlock: ingest {} events={}",
+                    sid, summary.events
+                ))?;
             }
             println!("{}", serde_json::to_string(&summary)?);
         }
-        Cmd::Report { session_id } => {
+        Cmd::Report { session_id, format } => {
             let sid = resolve_session_id_with_picker(&store, session_id)?;
             let report = summarize_session(&store, &sid)?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            let rendered = render_report(&report, format)?;
+            println!("{rendered}");
         }
         Cmd::Tui { session_id } => {
             let sid = match resolve_session_id_with_picker(&store, session_id) {
@@ -221,7 +410,7 @@ fn main() -> Result<()> {
             if !stdout().is_terminal() {
                 let report = summarize_session(&store, &sid)?;
                 println!("Sherlock TUI fallback (non-interactive terminal)\n");
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                println!("{}", render_report_json(&report)?);
                 return Ok(());
             }
             run_tui(&store, &sid)?;
@@ -252,7 +441,11 @@ impl SherlockStore {
 
     fn query_rows(&self, query: &str) -> Result<Vec<Value>> {
         let out = self.run(&["dolt", "sql", "-q", query, "-r", "json"])?;
-        let parsed: Value = serde_json::from_str(if out.trim().is_empty() { r#"{"rows":[]}"# } else { &out })?;
+        let parsed: Value = serde_json::from_str(if out.trim().is_empty() {
+            r#"{"rows":[]}"#
+        } else {
+            &out
+        })?;
         Ok(parsed
             .get("rows")
             .and_then(|r| r.as_array())
@@ -512,6 +705,7 @@ fn summarize_session(store: &SherlockStore, session_id: &str) -> Result<Value> {
     if session_rows.is_empty() {
         return Ok(json!({"error": "session_not_found", "session_id": session_id}));
     }
+    let session = &session_rows[0];
     let counts = store.query_rows(&format!(
         "SELECT \
          (SELECT COUNT(*) FROM turns WHERE session_id='{}') AS turns, \
@@ -521,7 +715,10 @@ fn summarize_session(store: &SherlockStore, session_id: &str) -> Result<Value> {
         sql(session_id),
         sql(session_id)
     ))?;
-    let top_sources = store.query_rows(&format!(
+    let totals = session_totals(store, session_id)?;
+    let prompt_stats = prompt_facts(store, session_id)?;
+    let grand_total = totals.total_tokens;
+    let top_source_rows = store.query_rows(&format!(
         "SELECT e.source_id, s.source_kind, COALESCE(s.plugin_id, '') AS plugin_id, COALESCE(s.tool_name, '') AS tool_name, COALESCE(s.hook_name, '') AS hook_name, COUNT(*) AS event_count \
          FROM events e JOIN sources s ON e.source_id = s.source_id \
          WHERE e.session_id='{}' \
@@ -529,10 +726,87 @@ fn summarize_session(store: &SherlockStore, session_id: &str) -> Result<Value> {
          ORDER BY event_count DESC LIMIT 50",
         sql(session_id)
     ))?;
-    let spikes = store.query_rows(&format!(
-        "SELECT start_time, delta_tokens FROM windows WHERE session_id='{}' ORDER BY delta_tokens DESC LIMIT 5",
-        sql(session_id)
-    ))?;
+    let source_token_totals = source_token_totals(store, session_id)?;
+    let mut enriched_sources: Vec<SourceFact> = top_source_rows
+        .iter()
+        .map(|src| {
+            let source_id = get_str(src, "source_id");
+            let estimated_tokens = source_token_totals.get(&source_id).copied().unwrap_or(0);
+            let estimated_pct = if grand_total > 0 {
+                (estimated_tokens as f64 * 100.0) / grand_total as f64
+            } else {
+                0.0
+            };
+            SourceFact {
+                source_id,
+                source_kind: get_str(src, "source_kind"),
+                plugin_id: get_str(src, "plugin_id"),
+                tool_name: get_str(src, "tool_name"),
+                hook_name: get_str(src, "hook_name"),
+                event_count: get_i64(src, "event_count"),
+                estimated_tokens,
+                estimated_pct,
+            }
+        })
+        .collect();
+    enriched_sources.sort_by(|a, b| {
+        b.estimated_tokens
+            .cmp(&a.estimated_tokens)
+            .then_with(|| b.event_count.cmp(&a.event_count))
+    });
+
+    let top_sources = enriched_sources.iter().take(5).cloned().collect::<Vec<_>>();
+    let plugin_sources = enriched_sources
+        .iter()
+        .filter(|source| !source.plugin_id.is_empty())
+        .take(10)
+        .cloned()
+        .collect::<Vec<_>>();
+    let spikes = spike_context(store, session_id)?;
+    let comparisons = session_comparison(store, &get_str(session, "project_root"), session_id, 3)?;
+    let facts = ReportFacts {
+        session_totals: totals.clone(),
+        prompt_stats: prompt_stats.clone(),
+        all_sources: enriched_sources.clone(),
+        top_sources: top_sources.clone(),
+        plugin_sources: plugin_sources.clone(),
+        spikes: spikes.clone(),
+        comparisons: comparisons.clone(),
+    };
+    let findings = findings_from_facts(&facts);
+    let recommendations = recommendations_from_findings(&findings);
+    let insights = insights_from_facts(&facts, &findings);
+    let report = SessionReport {
+        session_id: get_str(session, "session_id"),
+        started_at: get_str(session, "started_at"),
+        ended_at: get_str(session, "ended_at"),
+        project_root: get_str(session, "project_root"),
+        branch: get_str(session, "branch"),
+        model_family: get_str(session, "model_family"),
+        turns: counts.first().map(|row| get_i64(row, "turns")).unwrap_or(0),
+        events: counts
+            .first()
+            .map(|row| get_i64(row, "events"))
+            .unwrap_or(0),
+        windows: counts
+            .first()
+            .map(|row| get_i64(row, "windows"))
+            .unwrap_or(0),
+        totals: totals.clone(),
+        session_totals: totals,
+        prompt_stats,
+        top_sources,
+        plugin_sources,
+        spikes,
+        comparisons,
+        findings,
+        recommendations,
+        insights,
+    };
+    Ok(serde_json::to_value(report)?)
+}
+
+fn session_totals(store: &SherlockStore, session_id: &str) -> Result<SessionTotals> {
     let totals_rows = store.query_rows(&format!(
         "SELECT \
          COALESCE(MAX(input_tokens_cum),0) AS input_tokens, \
@@ -543,89 +817,836 @@ fn summarize_session(store: &SherlockStore, session_id: &str) -> Result<Value> {
         sql(session_id)
     ))?;
     let totals = totals_rows.first().cloned().unwrap_or_else(|| json!({}));
-    let source_token_totals = source_token_totals(store, session_id)?;
-    let grand_total = get_i64(&totals, "input_tokens")
-        + get_i64(&totals, "output_tokens")
-        + get_i64(&totals, "cache_read_tokens")
-        + get_i64(&totals, "cache_write_tokens");
-    let mut enriched_sources: Vec<Value> = top_sources
-        .iter()
-        .map(|src| {
-            let sid = get_str(src, "source_id");
-            let est = source_token_totals.get(&sid).copied().unwrap_or(0);
-            let pct = if grand_total > 0 {
-                (est as f64 * 100.0) / grand_total as f64
-            } else {
-                0.0
-            };
-            let mut obj = src.clone();
-            if let Some(m) = obj.as_object_mut() {
-                m.insert("estimated_tokens".to_string(), json!(est));
-                m.insert("estimated_pct".to_string(), json!(pct));
-            }
-            obj
-        })
-        .collect();
-    enriched_sources.sort_by_key(|v| -get_i64(v, "estimated_tokens"));
-    let plugin_sources: Vec<Value> = enriched_sources
-        .iter()
-        .filter(|v| !get_str(v, "plugin_id").is_empty())
-        .take(10)
-        .cloned()
-        .collect();
-    let cache_read = get_i64(&totals, "cache_read_tokens");
-    let input = get_i64(&totals, "input_tokens");
-    let output = get_i64(&totals, "output_tokens");
-    let mut insights = Vec::<Value>::new();
-    if grand_total > 0 {
-        insights.push(json!(format!(
-            "Cache read tokens are {:.1}% of total usage.",
-            (cache_read as f64 * 100.0) / grand_total as f64
-        )));
-    }
-    if let Some(top) = enriched_sources.first() {
-        insights.push(json!(format!(
-            "Top source: kind={} tool={} plugin={} estimated_tokens={}",
-            get_str(top, "source_kind"),
-            get_str(top, "tool_name"),
-            get_str(top, "plugin_id"),
-            get_i64(top, "estimated_tokens")
-        )));
-    }
-    if grand_total == 0 {
-        insights.push(json!(
-            "No token usage found for this session in the ingested source. Re-ingest from in-depth Claude project logs (.claude/projects/.../*.jsonl)."
-        ));
-    }
-    if cache_read > input + output {
-        insights.push(json!(
-            "Most spend appears to be context rehydration (cache reads), not direct prompt/response tokens."
-        ));
+    let input_tokens = get_i64(&totals, "input_tokens");
+    let output_tokens = get_i64(&totals, "output_tokens");
+    let cache_read_tokens = get_i64(&totals, "cache_read_tokens");
+    let cache_write_tokens = get_i64(&totals, "cache_write_tokens");
+    let total_tokens = input_tokens + output_tokens + cache_read_tokens + cache_write_tokens;
+    Ok(SessionTotals {
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        total_tokens,
+        cache_read_pct: pct(cache_read_tokens, total_tokens),
+        cache_write_pct: pct(cache_write_tokens, total_tokens),
+    })
+}
+
+fn prompt_facts(store: &SherlockStore, session_id: &str) -> Result<PromptStats> {
+    let artifact_path = history_artifact_path(store, session_id)?;
+    let Some(path) = artifact_path else {
+        return Ok(PromptStats::default());
+    };
+    let raw = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(_) => return Ok(PromptStats::default()),
+    };
+
+    let mut prompts = Vec::<PromptRecord>::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let obj: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if line_session_id(&obj).as_deref() != Some(session_id) {
+            continue;
+        }
+        let Some(text) = extract_prompt_text(&obj) else {
+            continue;
+        };
+        let is_compact_summary = obj
+            .get("isCompactSummary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        prompts.push(PromptRecord {
+            timestamp: event_time_value(&obj).unwrap_or_default(),
+            is_continuation_summary: continuation_summary_facts(&text) || is_compact_summary,
+            text,
+        });
     }
 
-    let mut out = session_rows[0].clone();
-    if let Some(obj) = out.as_object_mut() {
-        if let Some(c) = counts.first().and_then(Value::as_object) {
-            for (k, v) in c {
-                obj.insert(k.clone(), v.clone());
+    if prompts.is_empty() {
+        return Ok(PromptStats::default());
+    }
+
+    let total_prompt_chars = prompts
+        .iter()
+        .map(|prompt| prompt.text.chars().count())
+        .sum::<usize>();
+    let prompt_count = prompts.len();
+    let average_prompt_chars = total_prompt_chars as f64 / prompt_count as f64;
+    let mut longest_prompts = prompts
+        .iter()
+        .map(|prompt| PromptExcerpt {
+            timestamp: prompt.timestamp.clone(),
+            prompt_kind: if prompt.is_continuation_summary {
+                "continuation_summary".to_string()
+            } else {
+                "prompt".to_string()
+            },
+            chars: prompt.text.chars().count(),
+            excerpt: excerpt(&prompt.text, 120),
+        })
+        .collect::<Vec<_>>();
+    longest_prompts.sort_by(|a, b| b.chars.cmp(&a.chars));
+
+    let continuation_prompts = prompts
+        .iter()
+        .filter(|prompt| prompt.is_continuation_summary)
+        .collect::<Vec<_>>();
+    let continuation_total_chars = continuation_prompts
+        .iter()
+        .map(|prompt| prompt.text.chars().count())
+        .sum::<usize>();
+    let continuation_count = continuation_prompts.len();
+    let continuation_average = if continuation_count > 0 {
+        continuation_total_chars as f64 / continuation_count as f64
+    } else {
+        0.0
+    };
+    let continuation_max = continuation_prompts
+        .iter()
+        .map(|prompt| prompt.text.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    Ok(PromptStats {
+        prompt_count,
+        total_prompt_chars,
+        average_prompt_chars,
+        longest_prompts: longest_prompts.into_iter().take(3).collect(),
+        continuation_summaries: ContinuationSummaryStats {
+            count: continuation_count,
+            total_chars: continuation_total_chars,
+            average_chars: continuation_average,
+            max_chars: continuation_max,
+        },
+    })
+}
+
+fn continuation_summary_facts(text: &str) -> bool {
+    let compact = text.to_ascii_lowercase();
+    compact.contains("this session is being continued from a previous conversation")
+        || compact.contains("ran out of context")
+        || compact.contains("continue the conversation from where it left off")
+        || compact.contains("summary below covers the earlier portion of the conversation")
+}
+
+fn session_comparison(
+    store: &SherlockStore,
+    project_root: &str,
+    session_id: &str,
+    limit: usize,
+) -> Result<ComparisonFacts> {
+    let rows = store.query_rows(&format!(
+        "SELECT session_id, COALESCE(ended_at, started_at, '') AS ended_at \
+         FROM sessions \
+         WHERE project_root='{}' AND session_id<>'{}' \
+         ORDER BY COALESCE(ended_at, started_at) DESC LIMIT {}",
+        sql(project_root),
+        sql(session_id),
+        limit
+    ))?;
+    let mut recent_sessions = Vec::new();
+    for row in rows {
+        let sid = get_str(&row, "session_id");
+        let totals = session_totals(store, &sid)?;
+        let prompts = prompt_facts(store, &sid)?;
+        recent_sessions.push(ComparisonSession {
+            session_id: sid,
+            ended_at: get_str(&row, "ended_at"),
+            total_tokens: totals.total_tokens,
+            prompt_count: prompts.prompt_count,
+            total_prompt_chars: prompts.total_prompt_chars,
+            cache_read_tokens: totals.cache_read_tokens,
+            cache_read_pct: totals.cache_read_pct,
+        });
+    }
+
+    let delta_from_recent_average = if recent_sessions.is_empty() {
+        None
+    } else {
+        let divisor = recent_sessions.len() as f64;
+        let avg_total_tokens = recent_sessions
+            .iter()
+            .map(|item| item.total_tokens as f64)
+            .sum::<f64>()
+            / divisor;
+        let avg_prompt_count = recent_sessions
+            .iter()
+            .map(|item| item.prompt_count as f64)
+            .sum::<f64>()
+            / divisor;
+        let avg_prompt_chars = recent_sessions
+            .iter()
+            .map(|item| item.total_prompt_chars as f64)
+            .sum::<f64>()
+            / divisor;
+        let avg_cache_read_tokens = recent_sessions
+            .iter()
+            .map(|item| item.cache_read_tokens as f64)
+            .sum::<f64>()
+            / divisor;
+        let avg_cache_read_pct = recent_sessions
+            .iter()
+            .map(|item| item.cache_read_pct)
+            .sum::<f64>()
+            / divisor;
+        let current_totals = session_totals(store, session_id)?;
+        let current_prompts = prompt_facts(store, session_id)?;
+        Some(ComparisonDelta {
+            total_tokens: current_totals.total_tokens as f64 - avg_total_tokens,
+            total_tokens_pct: if avg_total_tokens > 0.0 {
+                ((current_totals.total_tokens as f64 - avg_total_tokens) * 100.0) / avg_total_tokens
+            } else {
+                0.0
+            },
+            prompt_count: current_prompts.prompt_count as f64 - avg_prompt_count,
+            total_prompt_chars: current_prompts.total_prompt_chars as f64 - avg_prompt_chars,
+            cache_read_tokens: current_totals.cache_read_tokens as f64 - avg_cache_read_tokens,
+            cache_read_pct_points: current_totals.cache_read_pct - avg_cache_read_pct,
+        })
+    };
+
+    Ok(ComparisonFacts {
+        project_root: project_root.to_string(),
+        compared_session_count: recent_sessions.len(),
+        recent_sessions,
+        delta_from_recent_average,
+    })
+}
+
+fn spike_context(store: &SherlockStore, session_id: &str) -> Result<Vec<SpikeFact>> {
+    // Recompute spike windows from turn deltas so context links by turn_index instead of timestamp text.
+    let turn_rows = store.query_rows(&format!(
+        "SELECT turn_index, started_at, ended_at, input_tokens_cum, output_tokens_cum, cache_read_tokens_cum, cache_write_tokens_cum \
+         FROM turns WHERE session_id='{}' ORDER BY turn_index ASC",
+        sql(session_id)
+    ))?;
+    let event_rows = store.query_rows(&format!(
+        "SELECT t.turn_index, e.event_time, e.event_type, COALESCE(s.tool_name, '') AS tool_name, \
+         COALESCE(s.plugin_id, '') AS plugin_id, COALESCE(s.hook_name, '') AS hook_name \
+         FROM events e \
+         JOIN turns t ON e.turn_id=t.turn_id \
+         JOIN sources s ON e.source_id=s.source_id \
+         WHERE e.session_id='{}' ORDER BY t.turn_index ASC",
+        sql(session_id)
+    ))?;
+    let nearby = event_rows
+        .iter()
+        .map(|row| NearbyEvent {
+            turn_index: get_i64(row, "turn_index"),
+            event_time: get_str(row, "event_time"),
+            event_type: get_str(row, "event_type"),
+            tool_name: get_str(row, "tool_name"),
+            plugin_id: get_str(row, "plugin_id"),
+            hook_name: get_str(row, "hook_name"),
+        })
+        .collect::<Vec<_>>();
+
+    #[derive(Clone)]
+    struct TurnSpike {
+        turn_index: i64,
+        start_time: String,
+        end_time: String,
+        delta_tokens: i64,
+    }
+    let mut prev_total: Option<i64> = None;
+    let mut computed_spikes = Vec::<TurnSpike>::new();
+    for row in &turn_rows {
+        let total = get_i64(row, "input_tokens_cum")
+            + get_i64(row, "output_tokens_cum")
+            + get_i64(row, "cache_read_tokens_cum")
+            + get_i64(row, "cache_write_tokens_cum");
+        if let Some(prev) = prev_total {
+            let delta = total - prev;
+            if delta >= 1000 {
+                computed_spikes.push(TurnSpike {
+                    turn_index: get_i64(row, "turn_index"),
+                    start_time: get_str(row, "started_at"),
+                    end_time: get_str(row, "ended_at"),
+                    delta_tokens: delta,
+                });
             }
         }
-        obj.insert("totals".to_string(), totals);
-        obj.insert("top_sources".to_string(), Value::Array(enriched_sources.into_iter().take(5).collect()));
-        obj.insert("plugin_sources".to_string(), Value::Array(plugin_sources));
-        obj.insert("spikes".to_string(), Value::Array(spikes));
-        obj.insert("insights".to_string(), Value::Array(insights));
+        prev_total = Some(total);
+    }
+    computed_spikes.sort_by_key(|spike| -spike.delta_tokens);
+    computed_spikes.truncate(5);
+
+    let mut out = Vec::new();
+    for spike in computed_spikes {
+        let focus_idx = nearby
+            .iter()
+            .position(|event| event.turn_index == spike.turn_index)
+            .unwrap_or(0);
+        let start_idx = focus_idx.saturating_sub(2);
+        let end_idx = usize::min(focus_idx + 3, nearby.len());
+        let context_slice = nearby[start_idx..end_idx].to_vec();
+        let mut tool_counts: HashMap<String, i64> = HashMap::new();
+        let mut event_counts: HashMap<String, i64> = HashMap::new();
+        for event in &context_slice {
+            let tool_label = if !event.tool_name.is_empty() {
+                event.tool_name.clone()
+            } else if !event.hook_name.is_empty() {
+                event.hook_name.clone()
+            } else {
+                "core".to_string()
+            };
+            *tool_counts.entry(tool_label).or_insert(0) += 1;
+            *event_counts.entry(event.event_type.clone()).or_insert(0) += 1;
+        }
+        out.push(SpikeFact {
+            start_time: spike.start_time,
+            end_time: spike.end_time,
+            reason: "spike".to_string(),
+            delta_tokens: spike.delta_tokens,
+            context: SpikeContext {
+                top_tools: top_label_counts(&tool_counts, 3),
+                top_event_types: top_label_counts(&event_counts, 3),
+                nearby_events: context_slice,
+            },
+        });
     }
     Ok(out)
+}
+
+fn findings_from_facts(facts: &ReportFacts) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let totals = &facts.session_totals;
+    let prompts = &facts.prompt_stats;
+    let workflow_tokens = workflow_tool_tokens(&facts.all_sources);
+    let plugin_tokens = facts
+        .plugin_sources
+        .iter()
+        .map(|source| source.estimated_tokens)
+        .sum::<i64>();
+    let tool_tokens = facts
+        .all_sources
+        .iter()
+        .filter(|source| source.source_kind == "tool")
+        .map(|source| source.estimated_tokens)
+        .sum::<i64>();
+
+    if totals.total_tokens == 0 {
+        findings.push(Finding {
+            id: "no-token-usage".to_string(),
+            severity: "medium".to_string(),
+            title: "No token usage was captured for this session.".to_string(),
+            detail: "The ingested history has events but no cumulative token growth, so the report cannot attribute spend beyond event volume.".to_string(),
+        });
+    }
+    if totals.total_tokens >= 10_000 && totals.cache_read_pct >= 60.0 {
+        findings.push(Finding {
+            id: "cache-read-dominated".to_string(),
+            severity: "high".to_string(),
+            title: "Cache reads dominate session spend.".to_string(),
+            detail: format!(
+                "Cache reads account for {:.1}% of total tokens ({} of {}).",
+                totals.cache_read_pct, totals.cache_read_tokens, totals.total_tokens
+            ),
+        });
+    }
+    if prompts.continuation_summaries.count > 0 && prompts.continuation_summaries.max_chars >= 3_000
+    {
+        findings.push(Finding {
+            id: "oversized-continuation-summary".to_string(),
+            severity: "medium".to_string(),
+            title: "Continuation summaries are unusually large.".to_string(),
+            detail: format!(
+                "{} continuation summaries contributed {} chars; the largest was {} chars.",
+                prompts.continuation_summaries.count,
+                prompts.continuation_summaries.total_chars,
+                prompts.continuation_summaries.max_chars
+            ),
+        });
+    }
+    if totals.total_tokens > 0 && pct(workflow_tokens, totals.total_tokens) >= 50.0 {
+        findings.push(Finding {
+            id: "workflow-heavy-session".to_string(),
+            severity: "medium".to_string(),
+            title: "Workflow orchestration tools dominate spend.".to_string(),
+            detail: format!(
+                "Read/TaskUpdate/Agent/Bash style tools account for {:.1}% of total tokens.",
+                pct(workflow_tokens, totals.total_tokens)
+            ),
+        });
+    }
+    if plugin_tokens > 0 && tool_tokens >= plugin_tokens * 3 {
+        findings.push(Finding {
+            id: "tool-driven-cost-over-plugin-cost".to_string(),
+            severity: "low".to_string(),
+            title: "Plugins are present but secondary to tool-driven cost.".to_string(),
+            detail: format!(
+                "Plugin-attributed sources account for {} estimated tokens versus {} for tool sources.",
+                plugin_tokens, tool_tokens
+            ),
+        });
+    }
+    if prompts.prompt_count <= 2 && totals.total_tokens >= 10_000 {
+        findings.push(Finding {
+            id: "low-prompt-count-high-usage".to_string(),
+            severity: "medium".to_string(),
+            title: "Few human prompts produced high total usage.".to_string(),
+            detail: format!(
+                "{} prompts drove {} total tokens, indicating context growth outside direct prompt volume.",
+                prompts.prompt_count, totals.total_tokens
+            ),
+        });
+    }
+
+    findings
+}
+
+fn recommendations_from_findings(findings: &[Finding]) -> Vec<Recommendation> {
+    let mut recommendations = Vec::new();
+    for finding in findings {
+        match finding.id.as_str() {
+            "cache-read-dominated" => recommendations.push(Recommendation {
+                id: "reduce-cache-churn".to_string(),
+                priority: "high".to_string(),
+                summary: "Reduce context rehydration between turns.".to_string(),
+                detail: "Trim repeated context blocks, compress carry-forward state, and prefer shorter resumable summaries before the next turn boundary.".to_string(),
+            }),
+            "oversized-continuation-summary" => recommendations.push(Recommendation {
+                id: "shrink-resume-summaries".to_string(),
+                priority: "medium".to_string(),
+                summary: "Shorten continuation summaries before resuming work.".to_string(),
+                detail: "Keep resume prompts focused on open decisions, active files, and next steps rather than replaying full session history.".to_string(),
+            }),
+            "workflow-heavy-session" => recommendations.push(Recommendation {
+                id: "batch-workflow-steps".to_string(),
+                priority: "medium".to_string(),
+                summary: "Batch orchestration work into fewer tool rounds.".to_string(),
+                detail: "Combine adjacent read/update/bash steps when the workflow is predictable so the session spends more tokens on synthesis than on control flow.".to_string(),
+            }),
+            "tool-driven-cost-over-plugin-cost" => recommendations.push(Recommendation {
+                id: "separate-plugin-vs-tool-optimization".to_string(),
+                priority: "low".to_string(),
+                summary: "Optimize the dominant tools before tuning plugin usage.".to_string(),
+                detail: "Plugin events are present, but the spend is driven more by the base tool loop than by plugin overhead.".to_string(),
+            }),
+            "low-prompt-count-high-usage" => recommendations.push(Recommendation {
+                id: "inspect-token-spikes".to_string(),
+                priority: "medium".to_string(),
+                summary: "Inspect the highest spike windows and long-running tool loops.".to_string(),
+                detail: "A small number of prompts produced disproportionate usage, so the main savings are likely in downstream tool activity or resumed context.".to_string(),
+            }),
+            "no-token-usage" => recommendations.push(Recommendation {
+                id: "reingest-rich-history".to_string(),
+                priority: "medium".to_string(),
+                summary: "Re-ingest from richer Claude project logs if available.".to_string(),
+                detail: "The current artifact did not expose token growth, so attribution quality will improve only if the source history includes cumulative usage data.".to_string(),
+            }),
+            _ => {}
+        }
+    }
+    recommendations
+}
+
+fn insights_from_facts(facts: &ReportFacts, findings: &[Finding]) -> Vec<String> {
+    let mut insights = Vec::new();
+    let totals = &facts.session_totals;
+    if totals.total_tokens > 0 {
+        insights.push(format!(
+            "Session used {} total tokens; cache reads were {:.1}% of spend.",
+            totals.total_tokens, totals.cache_read_pct
+        ));
+    } else {
+        insights.push(
+            "No token usage found for this session in the ingested source. Re-ingest from in-depth Claude project logs (.claude/projects/.../*.jsonl)."
+                .to_string(),
+        );
+    }
+    if facts.prompt_stats.prompt_count > 0 {
+        insights.push(format!(
+            "{} prompts totaled {} chars; average prompt length was {:.0} chars.",
+            facts.prompt_stats.prompt_count,
+            facts.prompt_stats.total_prompt_chars,
+            facts.prompt_stats.average_prompt_chars
+        ));
+    }
+    if let Some(top) = facts.top_sources.first() {
+        insights.push(format!(
+            "Top source: kind={} tool={} plugin={} estimated_tokens={}.",
+            top.source_kind,
+            if top.tool_name.is_empty() {
+                "n/a"
+            } else {
+                &top.tool_name
+            },
+            if top.plugin_id.is_empty() {
+                "n/a"
+            } else {
+                &top.plugin_id
+            },
+            top.estimated_tokens
+        ));
+    }
+    if let Some(delta) = &facts.comparisons.delta_from_recent_average {
+        insights.push(format!(
+            "Vs recent same-project sessions: total tokens {:+.0} ({:+.1}%), cache-read share {:+.1} points.",
+            delta.total_tokens, delta.total_tokens_pct, delta.cache_read_pct_points
+        ));
+    }
+    if let Some(spike) = facts.spikes.first() {
+        insights.push(format!(
+            "Largest spike window started at {} and added {} tokens.",
+            spike.start_time, spike.delta_tokens
+        ));
+    }
+    insights.extend(findings.iter().take(2).map(|finding| finding.title.clone()));
+    insights
+}
+
+fn render_report(report: &Value, format: ReportFormat) -> Result<String> {
+    match format {
+        ReportFormat::Json => render_report_json(report),
+        ReportFormat::Markdown => render_report_markdown(report),
+        ReportFormat::Text => render_report_text(report),
+    }
+}
+
+fn render_report_json(report: &Value) -> Result<String> {
+    Ok(serde_json::to_string_pretty(report)?)
+}
+
+fn render_report_markdown(report: &Value) -> Result<String> {
+    let mut out = String::new();
+    let totals = report
+        .get("session_totals")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let prompts = report
+        .get("prompt_stats")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let continuation = prompts
+        .get("continuation_summaries")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    writeln!(&mut out, "# Session Report")?;
+    writeln!(
+        &mut out,
+        "\nSession `{}` on `{}` used **{}** total tokens across **{}** turns and **{}** events. Cache reads were **{:.1}%** of spend. The session had **{}** human prompts totaling **{}** chars.",
+        get_str(report, "session_id"),
+        get_str(report, "project_root"),
+        get_i64(&totals, "total_tokens"),
+        get_i64(report, "turns"),
+        get_i64(report, "events"),
+        get_f64(&totals, "cache_read_pct"),
+        get_i64(&prompts, "prompt_count"),
+        get_i64(&prompts, "total_prompt_chars"),
+    )?;
+    if get_i64(&continuation, "count") > 0 {
+        writeln!(
+            &mut out,
+            "Continuation summaries appeared **{}** time(s) and contributed **{}** chars.",
+            get_i64(&continuation, "count"),
+            get_i64(&continuation, "total_chars"),
+        )?;
+    }
+
+    let findings = report
+        .get("findings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !findings.is_empty() {
+        writeln!(&mut out, "\n## Findings")?;
+        for finding in findings {
+            writeln!(
+                &mut out,
+                "- **{}** (`{}`): {}",
+                get_str(&finding, "title"),
+                get_str(&finding, "severity"),
+                get_str(&finding, "detail")
+            )?;
+        }
+    }
+
+    let recommendations = report
+        .get("recommendations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !recommendations.is_empty() {
+        writeln!(&mut out, "\n## Recommendations")?;
+        for recommendation in recommendations {
+            writeln!(
+                &mut out,
+                "- **{}** (`{}`): {}",
+                get_str(&recommendation, "summary"),
+                get_str(&recommendation, "priority"),
+                get_str(&recommendation, "detail")
+            )?;
+        }
+    }
+
+    let top_sources = report
+        .get("top_sources")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !top_sources.is_empty() {
+        writeln!(&mut out, "\n## Top Sources")?;
+        for source in top_sources {
+            let label = if !get_str(&source, "tool_name").is_empty() {
+                get_str(&source, "tool_name")
+            } else if !get_str(&source, "hook_name").is_empty() {
+                get_str(&source, "hook_name")
+            } else {
+                get_str(&source, "source_kind")
+            };
+            writeln!(
+                &mut out,
+                "- `{}`: {} estimated tokens ({:.1}%), {} events{}",
+                label,
+                get_i64(&source, "estimated_tokens"),
+                get_f64(&source, "estimated_pct"),
+                get_i64(&source, "event_count"),
+                if get_str(&source, "plugin_id").is_empty() {
+                    String::new()
+                } else {
+                    format!(", plugin `{}`", get_str(&source, "plugin_id"))
+                }
+            )?;
+        }
+    }
+
+    let spikes = report
+        .get("spikes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !spikes.is_empty() {
+        writeln!(&mut out, "\n## Spikes")?;
+        for spike in spikes {
+            let tools = spike
+                .get("context")
+                .and_then(|ctx| ctx.get("top_tools"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| {
+                            format!("{} ({})", get_str(item, "label"), get_i64(item, "count"))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            writeln!(
+                &mut out,
+                "- `{}`: {} tokens; nearby tools: {}",
+                get_str(&spike, "start_time"),
+                get_i64(&spike, "delta_tokens"),
+                if tools.is_empty() {
+                    "n/a".to_string()
+                } else {
+                    tools
+                }
+            )?;
+        }
+    }
+
+    Ok(out.trim_end().to_string())
+}
+
+fn render_report_text(report: &Value) -> Result<String> {
+    let mut out = String::new();
+    let totals = report
+        .get("session_totals")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let prompts = report
+        .get("prompt_stats")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    writeln!(
+        &mut out,
+        "Session {} on {}",
+        get_str(report, "session_id"),
+        get_str(report, "project_root")
+    )?;
+    writeln!(
+        &mut out,
+        "Totals: {} tokens, {} turns, {} events, cache read {:.1}%",
+        get_i64(&totals, "total_tokens"),
+        get_i64(report, "turns"),
+        get_i64(report, "events"),
+        get_f64(&totals, "cache_read_pct"),
+    )?;
+    writeln!(
+        &mut out,
+        "Prompts: {} prompts, {} chars total, {:.0} chars average",
+        get_i64(&prompts, "prompt_count"),
+        get_i64(&prompts, "total_prompt_chars"),
+        get_f64(&prompts, "average_prompt_chars"),
+    )?;
+
+    let findings = report
+        .get("findings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !findings.is_empty() {
+        writeln!(&mut out, "\nFindings:")?;
+        for finding in findings {
+            writeln!(
+                &mut out,
+                "- [{}] {}: {}",
+                get_str(&finding, "severity"),
+                get_str(&finding, "title"),
+                get_str(&finding, "detail")
+            )?;
+        }
+    }
+
+    let recommendations = report
+        .get("recommendations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !recommendations.is_empty() {
+        writeln!(&mut out, "\nRecommendations:")?;
+        for recommendation in recommendations {
+            writeln!(
+                &mut out,
+                "- [{}] {}: {}",
+                get_str(&recommendation, "priority"),
+                get_str(&recommendation, "summary"),
+                get_str(&recommendation, "detail")
+            )?;
+        }
+    }
+
+    Ok(out.trim_end().to_string())
+}
+
+fn history_artifact_path(store: &SherlockStore, session_id: &str) -> Result<Option<PathBuf>> {
+    let rows = store.query_rows(&format!(
+        "SELECT path_or_key FROM artifacts \
+         WHERE session_id='{}' AND artifact_type='history_jsonl' \
+         ORDER BY captured_at DESC LIMIT 1",
+        sql(session_id)
+    ))?;
+    Ok(rows
+        .first()
+        .map(|row| PathBuf::from(get_str(row, "path_or_key")))
+        .filter(|path| !path.as_os_str().is_empty()))
+}
+
+fn extract_prompt_text(obj: &Value) -> Option<String> {
+    if obj.get("type").and_then(Value::as_str) != Some("user")
+        && obj
+            .get("message")
+            .and_then(|message| message.get("role"))
+            .and_then(Value::as_str)
+            != Some("user")
+    {
+        return None;
+    }
+
+    let content = obj
+        .get("message")
+        .and_then(|message| message.get("content"))?;
+    match content {
+        Value::String(text) => Some(text.to_string()),
+        Value::Array(items) => {
+            let mut parts = Vec::new();
+            for item in items {
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                match item_type {
+                    "tool_result" | "tool_reference" => {}
+                    "text" => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            parts.push(text.to_string());
+                        }
+                    }
+                    _ => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            parts.push(text.to_string());
+                        } else if let Some(text) = item.as_str() {
+                            parts.push(text.to_string());
+                        }
+                    }
+                }
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn workflow_tool_tokens(sources: &[SourceFact]) -> i64 {
+    sources
+        .iter()
+        .filter(|source| is_workflow_tool(&source.tool_name))
+        .map(|source| source.estimated_tokens)
+        .sum()
+}
+
+fn is_workflow_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "Read"
+            | "TaskUpdate"
+            | "Task"
+            | "Agent"
+            | "Bash"
+            | "exec_command"
+            | "write_stdin"
+            | "spawn_agent"
+            | "send_input"
+    )
+}
+
+fn top_label_counts(counts: &HashMap<String, i64>, limit: usize) -> Vec<LabelCount> {
+    let mut items = counts
+        .iter()
+        .map(|(label, count)| LabelCount {
+            label: label.clone(),
+            count: *count,
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.label.cmp(&b.label)));
+    items.into_iter().take(limit).collect()
+}
+
+fn excerpt(text: &str, limit: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= limit {
+        collapsed
+    } else {
+        let mut shortened = collapsed.chars().take(limit).collect::<String>();
+        shortened.push('…');
+        shortened
+    }
+}
+
+fn pct(part: i64, total: i64) -> f64 {
+    if total > 0 {
+        (part as f64 * 100.0) / total as f64
+    } else {
+        0.0
+    }
 }
 
 fn resolve_session_id(store: &SherlockStore, session_id: Option<String>) -> Result<String> {
     if let Some(sid) = session_id {
         return Ok(sid);
     }
-    let rows = store.query_rows(
-        "SELECT session_id FROM sessions ORDER BY ended_at DESC LIMIT 1",
-    )?;
+    let rows =
+        store.query_rows("SELECT session_id FROM sessions ORDER BY ended_at DESC LIMIT 1")?;
     let sid = rows
         .first()
         .and_then(|r| r.get("session_id"))
@@ -634,7 +1655,10 @@ fn resolve_session_id(store: &SherlockStore, session_id: Option<String>) -> Resu
     Ok(sid.to_string())
 }
 
-fn resolve_session_id_with_picker(store: &SherlockStore, session_id: Option<String>) -> Result<String> {
+fn resolve_session_id_with_picker(
+    store: &SherlockStore,
+    session_id: Option<String>,
+) -> Result<String> {
     if session_id.is_some() {
         return resolve_session_id(store, session_id);
     }
@@ -679,7 +1703,11 @@ fn select_session_interactive(rows: &[Value], preferred_idx: usize) -> Result<St
             project
         );
     }
-    println!("Pick [1-{}] (Enter for {}): ", rows.len(), preferred_idx + 1);
+    println!(
+        "Pick [1-{}] (Enter for {}): ",
+        rows.len(),
+        preferred_idx + 1
+    );
     use std::io::{self, Write};
     io::stdout().flush()?;
     let mut input = String::new();
@@ -990,6 +2018,10 @@ fn get_i64(row: &Value, key: &str) -> i64 {
     row.get(key).and_then(Value::as_i64).unwrap_or(0)
 }
 
+fn get_f64(row: &Value, key: &str) -> f64 {
+    row.get(key).and_then(Value::as_f64).unwrap_or(0.0)
+}
+
 fn get_str(row: &Value, key: &str) -> String {
     row.get(key)
         .and_then(Value::as_str)
@@ -1048,13 +2080,11 @@ fn extract_usage(obj: &Value) -> UsageSample {
         .get("message")
         .and_then(|m| m.get("usage"))
         .or_else(|| obj.get("usage"));
-    let cache_creation_sum = usage
-        .and_then(|u| u.get("cache_creation"))
-        .map(|c| {
-            let a = safe_i64(c.get("ephemeral_1h_input_tokens")).unwrap_or(0);
-            let b = safe_i64(c.get("ephemeral_5m_input_tokens")).unwrap_or(0);
-            a + b
-        });
+    let cache_creation_sum = usage.and_then(|u| u.get("cache_creation")).map(|c| {
+        let a = safe_i64(c.get("ephemeral_1h_input_tokens")).unwrap_or(0);
+        let b = safe_i64(c.get("ephemeral_5m_input_tokens")).unwrap_or(0);
+        a + b
+    });
 
     let input_tokens = safe_i64(
         usage
@@ -1110,7 +2140,11 @@ fn event_time_value(obj: &Value) -> Option<String> {
     obj.get("created_at")
         .and_then(Value::as_str)
         .map(|s| s.to_string())
-        .or_else(|| obj.get("timestamp").and_then(Value::as_str).map(|s| s.to_string()))
+        .or_else(|| {
+            obj.get("timestamp")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string())
+        })
 }
 
 fn event_time_epoch(obj: &Value) -> Option<i64> {
@@ -1139,7 +2173,9 @@ fn extract_tool_name(obj: &Value) -> String {
         .and_then(|arr| {
             arr.iter().find_map(|item| {
                 if item.get("type").and_then(Value::as_str) == Some("tool_use") {
-                    item.get("name").and_then(Value::as_str).map(|s| s.to_string())
+                    item.get("name")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string())
                 } else {
                     None
                 }
@@ -1211,6 +2247,8 @@ fn extract_mcp_server_name(tool_name: &str) -> Option<String> {
 
 fn extract_hook_name(obj: &Value) -> String {
     obj.get("hook_event_name")
+        .or_else(|| obj.get("data").and_then(|data| data.get("hookName")))
+        .or_else(|| obj.get("data").and_then(|data| data.get("hookEvent")))
         .or_else(|| obj.get("subtype"))
         .and_then(Value::as_str)
         .unwrap_or("")
@@ -1263,7 +2301,11 @@ fn sha1_short(s: &str) -> String {
 }
 
 fn short_id(prefix: &str) -> String {
-    format!("{}-{}", prefix, Uuid::new_v4().simple().to_string()[..12].to_string())
+    format!(
+        "{}-{}",
+        prefix,
+        Uuid::new_v4().simple().to_string()[..12].to_string()
+    )
 }
 
 fn new_session_id() -> String {
@@ -1311,4 +2353,225 @@ fn default_history() -> PathBuf {
 fn default_projects_root() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
         .join(".claude/projects")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestEnv {
+        root: PathBuf,
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    fn setup_store() -> (TestEnv, SherlockStore) {
+        let root = std::env::temp_dir().join(format!("sherlock-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp root");
+        let env = TestEnv { root };
+        let store = SherlockStore::new(env.root.join("repo"));
+        fs::create_dir_all(&store.repo).expect("create repo dir");
+        store.init().expect("init store");
+        (env, store)
+    }
+
+    fn ingest_fixture(
+        store: &SherlockStore,
+        fixture: &str,
+        session_id: &str,
+        project_root: &Path,
+    ) -> IngestSummary {
+        ingest_session(
+            store,
+            &fixture_path(fixture),
+            session_id,
+            project_root,
+            "main",
+            "claude-sonnet",
+        )
+        .expect("ingest fixture")
+    }
+
+    #[test]
+    fn extract_prompt_text_ignores_tool_only_user_turns() {
+        let obj = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "content": "done", "tool_use_id": "toolu_1"}
+                ]
+            }
+        });
+        assert_eq!(extract_prompt_text(&obj), None);
+    }
+
+    #[test]
+    fn continuation_summary_detection_matches_compacted_prompt() {
+        let text = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.";
+        assert!(continuation_summary_facts(text));
+    }
+
+    #[test]
+    fn recommendation_rules_flag_expected_thresholds() {
+        let facts = ReportFacts {
+            session_totals: SessionTotals {
+                input_tokens: 1000,
+                output_tokens: 3000,
+                cache_read_tokens: 42000,
+                cache_write_tokens: 1000,
+                total_tokens: 47000,
+                cache_read_pct: 89.36170212765957,
+                cache_write_pct: 2.127659574468085,
+            },
+            prompt_stats: PromptStats {
+                prompt_count: 1,
+                total_prompt_chars: 4200,
+                average_prompt_chars: 4200.0,
+                longest_prompts: vec![],
+                continuation_summaries: ContinuationSummaryStats {
+                    count: 1,
+                    total_chars: 4200,
+                    average_chars: 4200.0,
+                    max_chars: 4200,
+                },
+            },
+            all_sources: vec![
+                SourceFact {
+                    tool_name: "Bash".to_string(),
+                    source_kind: "tool".to_string(),
+                    estimated_tokens: 26000,
+                    ..SourceFact::default()
+                },
+                SourceFact {
+                    tool_name: "Read".to_string(),
+                    source_kind: "tool".to_string(),
+                    estimated_tokens: 12000,
+                    ..SourceFact::default()
+                },
+            ],
+            plugin_sources: vec![SourceFact {
+                plugin_id: "skill:workflow".to_string(),
+                estimated_tokens: 4000,
+                ..SourceFact::default()
+            }],
+            ..ReportFacts::default()
+        };
+        let finding_ids = findings_from_facts(&facts)
+            .into_iter()
+            .map(|finding| finding.id)
+            .collect::<Vec<_>>();
+        assert!(finding_ids.contains(&"cache-read-dominated".to_string()));
+        assert!(finding_ids.contains(&"oversized-continuation-summary".to_string()));
+        assert!(finding_ids.contains(&"workflow-heavy-session".to_string()));
+        assert!(finding_ids.contains(&"low-prompt-count-high-usage".to_string()));
+        let recommendation_ids = recommendations_from_facts(&facts)
+            .into_iter()
+            .map(|recommendation| recommendation.id)
+            .collect::<Vec<_>>();
+        assert!(recommendation_ids.contains(&"reduce-cache-churn".to_string()));
+        assert!(recommendation_ids.contains(&"shrink-resume-summaries".to_string()));
+    }
+
+    #[test]
+    fn prompt_facts_count_human_prompts_and_summary_size() {
+        let (_temp, store) = setup_store();
+        let project_root = PathBuf::from("/tmp/project-alpha");
+        ingest_fixture(
+            &store,
+            "continuation_summary_heavy.jsonl",
+            "continuation-summary-heavy",
+            &project_root,
+        );
+        let facts = prompt_facts(&store, "continuation-summary-heavy").expect("prompt facts");
+        assert_eq!(facts.prompt_count, 2);
+        assert_eq!(facts.continuation_summaries.count, 1);
+        assert!(facts.continuation_summaries.max_chars >= 3000);
+        assert_eq!(facts.longest_prompts[0].prompt_kind, "continuation_summary");
+    }
+
+    #[test]
+    fn ingest_summarize_and_render_report_end_to_end() {
+        let (_temp, store) = setup_store();
+        let project_root = PathBuf::from("/tmp/project-alpha");
+        ingest_fixture(&store, "short_clean.jsonl", "short-clean", &project_root);
+        ingest_fixture(
+            &store,
+            "cache_read_heavy.jsonl",
+            "cache-read-heavy",
+            &project_root,
+        );
+        let report = summarize_session(&store, "cache-read-heavy").expect("summarize");
+        assert_eq!(get_str(&report, "session_id"), "cache-read-heavy");
+        assert!(report.get("session_totals").is_some());
+        assert!(report.get("prompt_stats").is_some());
+        assert!(report.get("comparisons").is_some());
+        assert!(report.get("recommendations").is_some());
+        let markdown = render_report_markdown(&report).expect("markdown");
+        let text = render_report_text(&report).expect("text");
+        assert!(markdown.contains("## Findings"));
+        assert!(markdown.contains("Cache reads dominate session spend."));
+        assert!(text.contains("Recommendations:"));
+        assert!(text.contains("Reduce context rehydration between turns."));
+    }
+
+    #[test]
+    fn regression_known_session_has_expected_findings() {
+        let (_temp, store) = setup_store();
+        let project_root = PathBuf::from("/tmp/project-alpha");
+        ingest_fixture(&store, "short_clean.jsonl", "short-clean", &project_root);
+        ingest_fixture(
+            &store,
+            "continuation_summary_heavy.jsonl",
+            "continuation-summary-heavy",
+            &project_root,
+        );
+        let report = summarize_session(&store, "continuation-summary-heavy").expect("summarize");
+        let finding_ids = report
+            .get("findings")
+            .and_then(Value::as_array)
+            .expect("findings array")
+            .iter()
+            .map(|finding| get_str(finding, "id"))
+            .collect::<Vec<_>>();
+        assert!(finding_ids.contains(&"oversized-continuation-summary".to_string()));
+        assert!(finding_ids.contains(&"low-prompt-count-high-usage".to_string()));
+    }
+
+    #[test]
+    fn zero_token_noisy_fixture_reports_missing_usage() {
+        let (_temp, store) = setup_store();
+        let project_root = PathBuf::from("/tmp/project-beta");
+        ingest_fixture(
+            &store,
+            "zero_token_noisy.jsonl",
+            "zero-token-noisy",
+            &project_root,
+        );
+        let report = summarize_session(&store, "zero-token-noisy").expect("summarize");
+        let totals = report
+            .get("session_totals")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        assert_eq!(get_i64(&totals, "total_tokens"), 0);
+        let finding_ids = report
+            .get("findings")
+            .and_then(Value::as_array)
+            .expect("findings array")
+            .iter()
+            .map(|finding| get_str(finding, "id"))
+            .collect::<Vec<_>>();
+        assert!(finding_ids.contains(&"no-token-usage".to_string()));
+    }
 }
