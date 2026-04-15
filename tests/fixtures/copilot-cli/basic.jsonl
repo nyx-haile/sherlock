@@ -1,0 +1,10 @@
+{"type":"session.start","data":{"sessionId":"copilot-basic","version":1,"producer":"copilot-agent","copilotVersion":"1.0.12","startTime":"2026-04-15T10:00:00.000Z","context":{"cwd":"/home/user/project"}},"id":"evt-1","timestamp":"2026-04-15T10:00:00.100Z","parentId":null}
+{"type":"user.message","data":{"content":"refactor the login handler to use the new auth middleware","interactionId":"int-1"},"id":"evt-2","timestamp":"2026-04-15T10:00:05.000Z","parentId":"evt-1"}
+{"type":"assistant.turn_start","data":{"turnId":"0","interactionId":"int-1"},"id":"evt-3","timestamp":"2026-04-15T10:00:05.100Z","parentId":"evt-2"}
+{"type":"tool.execution_start","data":{"toolCallId":"t-1","toolName":"bash","arguments":{"command":"rg login_handler"}},"id":"evt-4","timestamp":"2026-04-15T10:00:06.000Z","parentId":"evt-3"}
+{"type":"tool.execution_complete","data":{"toolCallId":"t-1","exitCode":0},"id":"evt-5","timestamp":"2026-04-15T10:00:06.500Z","parentId":"evt-4"}
+{"type":"tool.execution_start","data":{"toolCallId":"t-2","toolName":"str_replace_editor","arguments":{"command":"view","path":"src/auth.py"}},"id":"evt-6","timestamp":"2026-04-15T10:00:07.000Z","parentId":"evt-5"}
+{"type":"tool.execution_complete","data":{"toolCallId":"t-2","exitCode":0},"id":"evt-7","timestamp":"2026-04-15T10:00:07.400Z","parentId":"evt-6"}
+{"type":"assistant.message","data":{"content":"Refactored src/auth.py to call the new middleware.","interactionId":"int-1"},"id":"evt-8","timestamp":"2026-04-15T10:00:10.000Z","parentId":"evt-7"}
+{"type":"assistant.turn_end","data":{"turnId":"0"},"id":"evt-9","timestamp":"2026-04-15T10:00:10.100Z","parentId":"evt-8"}
+{"type":"session.shutdown","data":{"shutdownType":"routine","totalPremiumRequests":2,"totalApiDurationMs":5000,"modelMetrics":{"claude-sonnet-4.5":{"requests":{"count":2,"cost":2},"usage":{"inputTokens":12000,"outputTokens":800,"cacheReadTokens":8500,"cacheWriteTokens":0}}},"currentModel":"claude-sonnet-4.5","currentTokens":12800},"id":"evt-10","timestamp":"2026-04-15T10:00:11.000Z","parentId":"evt-9"}

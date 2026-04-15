@@ -1,5 +1,10 @@
+mod analyze;
+mod install_skill;
+mod providers;
+
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use providers::{Provider, RawEvent};
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode},
@@ -32,7 +37,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at TEXT,
     project_root TEXT,
     branch TEXT,
-    model_family TEXT
+    model_family TEXT,
+    provider VARCHAR(32) NOT NULL DEFAULT 'claude-code'
 );
 
 CREATE TABLE IF NOT EXISTS session_aliases (
@@ -81,7 +87,8 @@ CREATE TABLE IF NOT EXISTS events (
     event_type VARCHAR(64) NOT NULL,
     source_id VARCHAR(64),
     payload_bytes INTEGER,
-    raw_ref VARCHAR(255)
+    raw_ref VARCHAR(255),
+    provider VARCHAR(32) NOT NULL DEFAULT 'claude-code'
 );
 
 CREATE TABLE IF NOT EXISTS windows (
@@ -131,6 +138,14 @@ CREATE INDEX IF NOT EXISTS idx_sources_fingerprint ON sources(fingerprint);
 CREATE INDEX IF NOT EXISTS idx_session_aliases_session ON session_aliases(session_id);
 "#;
 
+// Columns added after initial schema. Applied idempotently on every store open
+// via an information_schema probe — Dolt (1.86) does not support
+// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so we check-then-add.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("sessions", "provider", "VARCHAR(32) NOT NULL DEFAULT 'claude-code'"),
+    ("events", "provider", "VARCHAR(32) NOT NULL DEFAULT 'claude-code'"),
+];
+
 #[derive(Parser)]
 #[command(name = "sherlock")]
 #[command(about = "Sherlock token-usage forensic tool (Rust runtime)")]
@@ -158,6 +173,12 @@ enum Cmd {
         branch: Option<String>,
         #[arg(long, default_value = "")]
         model_family: String,
+        /// Provider id (claude-code, codex, copilot-cli, copilot-vscode, antigravity, cursor). Auto-detected if omitted.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Acknowledge that the cursor adapter is experimental.
+        #[arg(long, default_value_t = false)]
+        experimental_cursor: bool,
         #[arg(long, default_value_t = false)]
         commit: bool,
     },
@@ -184,6 +205,33 @@ enum Cmd {
     RemoveAlias {
         /// Alias to remove
         alias: String,
+    },
+    /// Produce an LLM-narrated analysis of one or more session reports.
+    Analyze {
+        /// Session id(s) to analyze. Pass multiple for comparison mode.
+        #[arg(long, num_args = 1..)]
+        session_id: Vec<String>,
+        /// Backend: anthropic, openai, gemini, openai-compatible, prompt-only. Auto-detected from env if omitted.
+        #[arg(long)]
+        backend: Option<String>,
+        /// Model id. Backend-specific default if omitted.
+        #[arg(long)]
+        model: Option<String>,
+        /// Base URL for openai-compatible backends (Ollama, LM Studio, Together, DeepSeek, Groq).
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Env var name holding the API key. Defaults per backend.
+        #[arg(long)]
+        api_key_env: Option<String>,
+    },
+    /// Install the bundled Claude Code skill into ~/.claude/skills.
+    InstallSkill {
+        /// Destination directory (default: ~/.claude/skills/sherlock-analyze)
+        #[arg(long)]
+        dest: Option<PathBuf>,
+        /// Overwrite existing files.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 }
 
@@ -332,6 +380,7 @@ struct Recommendation {
 #[derive(Clone, Debug, Default, Serialize)]
 struct SessionReport {
     session_id: String,
+    provider: String,
     started_at: String,
     ended_at: String,
     project_root: String,
@@ -379,6 +428,10 @@ fn main() -> Result<()> {
     
     fs::create_dir_all(&cli.repo)?;
     let store = SherlockStore::new(cli.repo);
+    // Apply pending additive migrations on every invocation. Cheap — just an
+    // information_schema probe when everything is already up to date — and
+    // ensures old repos gain new columns without the user running `init`.
+    let _ = store.migrate();
 
     match cli.cmd {
         Cmd::Init { commit } => {
@@ -397,14 +450,30 @@ fn main() -> Result<()> {
             project_root,
             branch,
             model_family,
+            provider,
+            experimental_cursor,
             commit,
         } => {
             store.init()?;
             let effective_history = resolve_history_path(history, &project_root)?;
-            let sid = resolve_ingest_session_id(&effective_history, session_id)?;
+            let provider_box: Box<dyn Provider> = match provider.as_deref() {
+                Some(id) => providers::by_id(id)
+                    .ok_or_else(|| anyhow!("unknown provider: {id}"))?,
+                None => providers::detect_provider(&effective_history),
+            };
+            if provider_box.id() == "cursor" && !experimental_cursor {
+                return Err(anyhow!(
+                    "cursor adapter is experimental; re-run with --experimental-cursor to acknowledge"
+                ));
+            }
+            if let Some(warning) = provider_box.instability_warning() {
+                eprintln!("⚠️  {}", warning);
+            }
+            let sid = resolve_ingest_session_id(&*provider_box, &effective_history, session_id)?;
             let b = branch.unwrap_or_else(|| git_branch(&project_root).unwrap_or_default());
             let summary = ingest_session(
                 &store,
+                &*provider_box,
                 &effective_history,
                 &sid,
                 &project_root,
@@ -481,6 +550,53 @@ fn main() -> Result<()> {
             ))?;
             println!("✓ Removed alias '{}'", alias);
         }
+        Cmd::Analyze {
+            session_id,
+            backend,
+            model,
+            base_url,
+            api_key_env,
+        } => {
+            let sids = if session_id.is_empty() {
+                vec![resolve_session_id_with_picker(&store, None)?]
+            } else {
+                session_id
+                    .into_iter()
+                    .map(|s| resolve_session_or_alias(&store, &s))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            let reports: Vec<Value> = sids
+                .iter()
+                .map(|sid| summarize_session(&store, sid))
+                .collect::<Result<Vec<_>>>()?;
+            let backend_id = match backend {
+                Some(s) => analyze::parse_backend_id(&s)?,
+                None => analyze::auto_select(),
+            };
+            let backend_impl = analyze::make_backend(backend_id, model, base_url, api_key_env)?;
+            let req = analyze::assemble(&reports);
+            let out = backend_impl.send(&req)?;
+            println!("{}", out);
+        }
+        Cmd::InstallSkill { dest, force } => {
+            let target = match dest {
+                Some(p) => p,
+                None => install_skill::default_dest()?,
+            };
+            let written = install_skill::install(&target, force)?;
+            println!(
+                "{}",
+                json!({
+                    "ok": true,
+                    "dest": target.display().to_string(),
+                    "files": written.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                })
+            );
+            eprintln!(
+                "✓ Installed sherlock-analyze skill at {}\n  Restart Claude Code or run /help skills to confirm it's registered.",
+                target.display()
+            );
+        }
     }
 
     Ok(())
@@ -498,6 +614,30 @@ impl SherlockStore {
     fn init(&self) -> Result<()> {
         self.run_allow_fail(&["dolt", "init", "-b", "main"])?;
         self.run_with_input(&["dolt", "sql"], SCHEMA_SQL)?;
+        self.migrate()?;
+        Ok(())
+    }
+
+    fn migrate(&self) -> Result<()> {
+        for (table, column, decl) in ADDED_COLUMNS {
+            let probe = format!(
+                "SELECT COUNT(*) AS c FROM information_schema.columns \
+                 WHERE table_schema = DATABASE() AND table_name = '{}' AND column_name = '{}'",
+                table, column
+            );
+            let rows = match self.query_rows(&probe) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let exists = rows
+                .first()
+                .map(|row| get_i64(row, "c") > 0)
+                .unwrap_or(false);
+            if !exists {
+                let alter = format!("ALTER TABLE {} ADD COLUMN {} {};", table, column, decl);
+                let _ = self.run_with_input(&["dolt", "sql"], &alter);
+            }
+        }
         Ok(())
     }
 
@@ -579,6 +719,7 @@ impl SherlockStore {
 
 fn ingest_session(
     store: &SherlockStore,
+    provider: &dyn Provider,
     history_path: &Path,
     session_id: &str,
     project_root: &Path,
@@ -591,14 +732,15 @@ fn ingest_session(
     let mut sql_script = String::new();
     sql_script.push_str("START TRANSACTION;\n");
     sql_script.push_str(&format!(
-        "INSERT INTO sessions(session_id, started_at, project_root, branch, model_family) \
-         VALUES ('{}','{}','{}','{}','{}') \
-         ON DUPLICATE KEY UPDATE started_at=VALUES(started_at), project_root=VALUES(project_root), branch=VALUES(branch), model_family=VALUES(model_family);\n",
+        "INSERT INTO sessions(session_id, started_at, project_root, branch, model_family, provider) \
+         VALUES ('{}','{}','{}','{}','{}','{}') \
+         ON DUPLICATE KEY UPDATE started_at=VALUES(started_at), project_root=VALUES(project_root), branch=VALUES(branch), model_family=VALUES(model_family), provider=VALUES(provider);\n",
         sql(session_id),
         sql(&started_at),
         sql(&project_root.display().to_string()),
         sql(branch),
-        sql(model_family)
+        sql(model_family),
+        sql(provider.id())
     ));
     // Re-ingest is idempotent: replace session-scoped derived records.
     sql_script.push_str(&format!(
@@ -651,20 +793,27 @@ fn ingest_session(
             Ok(v) => v,
             Err(_) => continue,
         };
-        if line_session_id(&obj).as_deref() != Some(session_id) {
-            continue;
+        let ev = RawEvent::Json(obj.clone());
+        // An event belongs to the ingestion target if it explicitly names that
+        // session, or if the provider doesn't tag every event (None) — copilot
+        // CLI, for example, only stamps session.start with a sessionId.
+        match provider.extract_session_id(&ev) {
+            Some(id) if id != session_id => continue,
+            _ => {}
         }
 
-        let event_time = event_time_value(&obj).unwrap_or_else(|| started_at.clone());
+        let event_time = provider
+            .event_time_value(&ev)
+            .unwrap_or_else(|| started_at.clone());
         if first_event_time.is_none() {
             first_event_time = Some(event_time.clone());
         }
         last_event_time = Some(event_time.clone());
-        let event_type = infer_event_type(&obj);
-        let tool_name = extract_tool_name(&obj);
-        let hook_name = extract_hook_name(&obj);
-        let plugin_id = extract_plugin_id(&obj, &tool_name);
-        let mcp_server_name = extract_mcp_server_name(&tool_name);
+        let event_type = provider.infer_event_type(&ev);
+        let tool_name = provider.extract_tool_name(&ev);
+        let hook_name = provider.extract_hook_name(&ev);
+        let plugin_id = provider.extract_plugin_id(&ev, &tool_name);
+        let mcp_server_name = provider.extract_mcp_server_name(&tool_name);
         let plugin_part = plugin_id.clone().unwrap_or_default();
         let mcp_part = mcp_server_name.clone().unwrap_or_default();
         let fp = format!(
@@ -688,7 +837,7 @@ fn ingest_session(
         }
 
         let turn_id = short_id("turn");
-        let usage = extract_usage(&obj);
+        let usage = provider.extract_usage(&ev);
         cum_input += usage.input_tokens.unwrap_or(0);
         cum_output += usage.output_tokens.unwrap_or(0);
         cum_cache_read += usage.cache_read_tokens.unwrap_or(0);
@@ -711,8 +860,8 @@ fn ingest_session(
         turns += 1;
 
         sql_script.push_str(&format!(
-            "INSERT INTO events(event_id, session_id, turn_id, event_time, event_type, source_id, payload_bytes, raw_ref) \
-             VALUES ('{}','{}','{}','{}','{}','{}',{},'{}:{}');\n",
+            "INSERT INTO events(event_id, session_id, turn_id, event_time, event_type, source_id, payload_bytes, raw_ref, provider) \
+             VALUES ('{}','{}','{}','{}','{}','{}',{},'{}:{}','{}');\n",
             short_id("event"),
             sql(session_id),
             turn_id,
@@ -721,14 +870,15 @@ fn ingest_session(
             source_id,
             payload_bytes,
             artifact_id,
-            idx + 1
+            idx + 1,
+            sql(provider.id())
         ));
         events += 1;
 
         let total = cum_input + cum_output + cum_cache_read + cum_cache_write;
         if let Some(prev) = prev_total {
             let delta = total - prev;
-            if delta >= 1000 {
+            if delta >= provider.spike_threshold() {
                 windows += 1;
                 sql_script.push_str(&format!(
                     "INSERT INTO windows(window_id, session_id, start_time, end_time, reason, delta_tokens, delta_cost_usd) \
@@ -765,13 +915,16 @@ fn ingest_session(
 
 fn summarize_session(store: &SherlockStore, session_id: &str) -> Result<Value> {
     let session_rows = store.query_rows(&format!(
-        "SELECT session_id, started_at, ended_at, project_root, branch, model_family FROM sessions WHERE session_id='{}'",
+        "SELECT session_id, started_at, ended_at, project_root, branch, model_family, COALESCE(provider,'claude-code') AS provider FROM sessions WHERE session_id='{}'",
         sql(session_id)
     ))?;
     if session_rows.is_empty() {
         return Ok(json!({"error": "session_not_found", "session_id": session_id}));
     }
     let session = &session_rows[0];
+    let provider_id = get_str(session, "provider");
+    let provider = providers::by_id(if provider_id.is_empty() { "claude-code" } else { &provider_id })
+        .unwrap_or_else(|| Box::new(providers::claude_code::ClaudeCodeProvider));
     let counts = store.query_rows(&format!(
         "SELECT \
          (SELECT COUNT(*) FROM turns WHERE session_id='{}') AS turns, \
@@ -782,7 +935,7 @@ fn summarize_session(store: &SherlockStore, session_id: &str) -> Result<Value> {
         sql(session_id)
     ))?;
     let totals = session_totals(store, session_id)?;
-    let prompt_stats = prompt_facts(store, session_id)?;
+    let prompt_stats = prompt_facts(store, &*provider, session_id)?;
     let grand_total = totals.total_tokens;
     let top_source_rows = store.query_rows(&format!(
         "SELECT e.source_id, s.source_kind, COALESCE(s.plugin_id, '') AS plugin_id, COALESCE(s.tool_name, '') AS tool_name, COALESCE(s.hook_name, '') AS hook_name, COUNT(*) AS event_count \
@@ -834,8 +987,8 @@ fn summarize_session(store: &SherlockStore, session_id: &str) -> Result<Value> {
         .take(10)
         .cloned()
         .collect::<Vec<_>>();
-    let spikes = spike_context(store, session_id)?;
-    let comparisons = session_comparison(store, &get_str(session, "project_root"), session_id, 3)?;
+    let spikes = spike_context(store, &*provider, session_id)?;
+    let comparisons = session_comparison(store, &*provider, &get_str(session, "project_root"), session_id, 3)?;
     let facts = ReportFacts {
         session_totals: totals.clone(),
         prompt_stats: prompt_stats.clone(),
@@ -845,11 +998,12 @@ fn summarize_session(store: &SherlockStore, session_id: &str) -> Result<Value> {
         spikes: spikes.clone(),
         comparisons: comparisons.clone(),
     };
-    let findings = findings_from_facts(&facts);
+    let findings = findings_from_facts(&*provider, &facts);
     let recommendations = recommendations_from_findings(&findings);
     let insights = insights_from_facts(&facts, &findings);
     let report = SessionReport {
         session_id: get_str(session, "session_id"),
+        provider: provider.id().to_string(),
         started_at: get_str(session, "started_at"),
         ended_at: get_str(session, "ended_at"),
         project_root: get_str(session, "project_root"),
@@ -906,7 +1060,11 @@ fn session_totals(store: &SherlockStore, session_id: &str) -> Result<SessionTota
     })
 }
 
-fn prompt_facts(store: &SherlockStore, session_id: &str) -> Result<PromptStats> {
+fn prompt_facts(
+    store: &SherlockStore,
+    provider: &dyn Provider,
+    session_id: &str,
+) -> Result<PromptStats> {
     let artifact_path = history_artifact_path(store, session_id)?;
     let Some(path) = artifact_path else {
         return Ok(PromptStats::default());
@@ -925,19 +1083,21 @@ fn prompt_facts(store: &SherlockStore, session_id: &str) -> Result<PromptStats> 
             Ok(value) => value,
             Err(_) => continue,
         };
-        if line_session_id(&obj).as_deref() != Some(session_id) {
-            continue;
+        let ev = RawEvent::Json(obj);
+        // An event belongs to the ingestion target if it explicitly names that
+        // session, or if the provider doesn't tag every event (None) — copilot
+        // CLI, for example, only stamps session.start with a sessionId.
+        match provider.extract_session_id(&ev) {
+            Some(id) if id != session_id => continue,
+            _ => {}
         }
-        let Some(text) = extract_prompt_text(&obj) else {
+        let Some(text) = provider.extract_prompt_text(&ev) else {
             continue;
         };
-        let is_compact_summary = obj
-            .get("isCompactSummary")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let is_compact = provider.is_compact_summary(&ev);
         prompts.push(PromptRecord {
-            timestamp: event_time_value(&obj).unwrap_or_default(),
-            is_continuation_summary: continuation_summary_facts(&text) || is_compact_summary,
+            timestamp: provider.event_time_value(&ev).unwrap_or_default(),
+            is_continuation_summary: provider.is_continuation_summary(&text) || is_compact,
             text,
         });
     }
@@ -1001,16 +1161,9 @@ fn prompt_facts(store: &SherlockStore, session_id: &str) -> Result<PromptStats> 
     })
 }
 
-fn continuation_summary_facts(text: &str) -> bool {
-    let compact = text.to_ascii_lowercase();
-    compact.contains("this session is being continued from a previous conversation")
-        || compact.contains("ran out of context")
-        || compact.contains("continue the conversation from where it left off")
-        || compact.contains("summary below covers the earlier portion of the conversation")
-}
-
 fn session_comparison(
     store: &SherlockStore,
+    provider: &dyn Provider,
     project_root: &str,
     session_id: &str,
     limit: usize,
@@ -1028,7 +1181,7 @@ fn session_comparison(
     for row in rows {
         let sid = get_str(&row, "session_id");
         let totals = session_totals(store, &sid)?;
-        let prompts = prompt_facts(store, &sid)?;
+        let prompts = prompt_facts(store, provider, &sid)?;
         recent_sessions.push(ComparisonSession {
             session_id: sid,
             ended_at: get_str(&row, "ended_at"),
@@ -1070,7 +1223,7 @@ fn session_comparison(
             .sum::<f64>()
             / divisor;
         let current_totals = session_totals(store, session_id)?;
-        let current_prompts = prompt_facts(store, session_id)?;
+        let current_prompts = prompt_facts(store, provider, session_id)?;
         Some(ComparisonDelta {
             total_tokens: current_totals.total_tokens as f64 - avg_total_tokens,
             total_tokens_pct: if avg_total_tokens > 0.0 {
@@ -1093,7 +1246,11 @@ fn session_comparison(
     })
 }
 
-fn spike_context(store: &SherlockStore, session_id: &str) -> Result<Vec<SpikeFact>> {
+fn spike_context(
+    store: &SherlockStore,
+    provider: &dyn Provider,
+    session_id: &str,
+) -> Result<Vec<SpikeFact>> {
     // Recompute spike windows from turn deltas so context links by turn_index instead of timestamp text.
     let turn_rows = store.query_rows(&format!(
         "SELECT turn_index, started_at, ended_at, input_tokens_cum, output_tokens_cum, cache_read_tokens_cum, cache_write_tokens_cum \
@@ -1137,7 +1294,7 @@ fn spike_context(store: &SherlockStore, session_id: &str) -> Result<Vec<SpikeFac
             + get_i64(row, "cache_write_tokens_cum");
         if let Some(prev) = prev_total {
             let delta = total - prev;
-            if delta >= 1000 {
+            if delta >= provider.spike_threshold() {
                 computed_spikes.push(TurnSpike {
                     turn_index: get_i64(row, "turn_index"),
                     start_time: get_str(row, "started_at"),
@@ -1188,11 +1345,11 @@ fn spike_context(store: &SherlockStore, session_id: &str) -> Result<Vec<SpikeFac
     Ok(out)
 }
 
-fn findings_from_facts(facts: &ReportFacts) -> Vec<Finding> {
+fn findings_from_facts(provider: &dyn Provider, facts: &ReportFacts) -> Vec<Finding> {
     let mut findings = Vec::new();
     let totals = &facts.session_totals;
     let prompts = &facts.prompt_stats;
-    let workflow_tokens = workflow_tool_tokens(&facts.all_sources);
+    let workflow_tokens = workflow_tool_tokens(provider, &facts.all_sources);
     let plugin_tokens = facts
         .plugin_sources
         .iter()
@@ -1213,7 +1370,10 @@ fn findings_from_facts(facts: &ReportFacts) -> Vec<Finding> {
             detail: "The ingested history has events but no cumulative token growth, so the report cannot attribute spend beyond event volume.".to_string(),
         });
     }
-    if totals.total_tokens >= 10_000 && totals.cache_read_pct >= 60.0 {
+    if provider.has_cache_tokens()
+        && totals.total_tokens >= 10_000
+        && totals.cache_read_pct >= 60.0
+    {
         findings.push(Finding {
             id: "cache-read-dominated".to_string(),
             severity: "high".to_string(),
@@ -1224,7 +1384,9 @@ fn findings_from_facts(facts: &ReportFacts) -> Vec<Finding> {
             ),
         });
     }
-    if prompts.continuation_summaries.count > 0 && prompts.continuation_summaries.max_chars >= 3_000
+    if provider.has_continuation_summaries()
+        && prompts.continuation_summaries.count > 0
+        && prompts.continuation_summaries.max_chars >= 3_000
     {
         findings.push(Finding {
             id: "oversized-continuation-summary".to_string(),
@@ -1646,73 +1808,12 @@ fn history_artifact_path(store: &SherlockStore, session_id: &str) -> Result<Opti
         .filter(|path| !path.as_os_str().is_empty()))
 }
 
-fn extract_prompt_text(obj: &Value) -> Option<String> {
-    if obj.get("type").and_then(Value::as_str) != Some("user")
-        && obj
-            .get("message")
-            .and_then(|message| message.get("role"))
-            .and_then(Value::as_str)
-            != Some("user")
-    {
-        return None;
-    }
-
-    let content = obj
-        .get("message")
-        .and_then(|message| message.get("content"))?;
-    match content {
-        Value::String(text) => Some(text.to_string()),
-        Value::Array(items) => {
-            let mut parts = Vec::new();
-            for item in items {
-                let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-                match item_type {
-                    "tool_result" | "tool_reference" => {}
-                    "text" => {
-                        if let Some(text) = item.get("text").and_then(Value::as_str) {
-                            parts.push(text.to_string());
-                        }
-                    }
-                    _ => {
-                        if let Some(text) = item.get("text").and_then(Value::as_str) {
-                            parts.push(text.to_string());
-                        } else if let Some(text) = item.as_str() {
-                            parts.push(text.to_string());
-                        }
-                    }
-                }
-            }
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts.join("\n\n"))
-            }
-        }
-        _ => None,
-    }
-}
-
-fn workflow_tool_tokens(sources: &[SourceFact]) -> i64 {
+fn workflow_tool_tokens(provider: &dyn Provider, sources: &[SourceFact]) -> i64 {
     sources
         .iter()
-        .filter(|source| is_workflow_tool(&source.tool_name))
+        .filter(|source| provider.is_workflow_tool(&source.tool_name))
         .map(|source| source.estimated_tokens)
         .sum()
-}
-
-fn is_workflow_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "Read"
-            | "TaskUpdate"
-            | "Task"
-            | "Agent"
-            | "Bash"
-            | "exec_command"
-            | "write_stdin"
-            | "spawn_agent"
-            | "send_input"
-    )
 }
 
 fn top_label_counts(counts: &HashMap<String, i64>, limit: usize) -> Vec<LabelCount> {
@@ -1879,7 +1980,11 @@ fn preferred_session_index(rows: &[Value], cwd: &Path) -> Option<usize> {
     Some(0)
 }
 
-fn resolve_ingest_session_id(history_path: &Path, provided: Option<String>) -> Result<String> {
+fn resolve_ingest_session_id(
+    provider: &dyn Provider,
+    history_path: &Path,
+    provided: Option<String>,
+) -> Result<String> {
     if let Some(sid) = provided {
         return Ok(sid);
     }
@@ -1893,11 +1998,12 @@ fn resolve_ingest_session_id(history_path: &Path, provided: Option<String>) -> R
             Ok(v) => v,
             Err(_) => continue,
         };
-        let sid = match line_session_id(&obj) {
+        let ev = RawEvent::Json(obj);
+        let sid = match provider.extract_session_id(&ev) {
             Some(v) => v,
             None => continue,
         };
-        let ts = event_time_epoch(&obj).unwrap_or(0);
+        let ts = provider.event_time_epoch(&ev).unwrap_or(0);
         match &best {
             Some((cur_ts, _)) if *cur_ts >= ts => {}
             _ => best = Some((ts, sid)),
@@ -2148,25 +2254,6 @@ fn get_str(row: &Value, key: &str) -> String {
         .to_string()
 }
 
-fn infer_event_type(obj: &Value) -> String {
-    if !extract_tool_name(obj).is_empty() {
-        return "tool_call".to_string();
-    }
-    if !extract_hook_name(obj).is_empty() {
-        return "hook_event".to_string();
-    }
-    if obj.get("type").and_then(Value::as_str) == Some("user")
-        || obj
-            .get("message")
-            .and_then(|m| m.get("role"))
-            .and_then(Value::as_str)
-            == Some("user")
-    {
-        return "prompt_submit".to_string();
-    }
-    "assistant_turn".to_string()
-}
-
 fn source_kind(event_type: &str) -> &'static str {
     if event_type.starts_with("hook") {
         "hook"
@@ -2175,203 +2262,6 @@ fn source_kind(event_type: &str) -> &'static str {
     } else {
         "core"
     }
-}
-
-fn safe_i64(v: Option<&Value>) -> Option<i64> {
-    match v {
-        None => None,
-        Some(Value::Number(n)) => n.as_i64(),
-        Some(Value::String(s)) => s.parse::<i64>().ok(),
-        _ => None,
-    }
-}
-
-#[derive(Default)]
-struct UsageSample {
-    input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
-    cache_read_tokens: Option<i64>,
-    cache_write_tokens: Option<i64>,
-}
-
-fn extract_usage(obj: &Value) -> UsageSample {
-    let usage = obj
-        .get("message")
-        .and_then(|m| m.get("usage"))
-        .or_else(|| obj.get("usage"));
-    let cache_creation_sum = usage.and_then(|u| u.get("cache_creation")).map(|c| {
-        let a = safe_i64(c.get("ephemeral_1h_input_tokens")).unwrap_or(0);
-        let b = safe_i64(c.get("ephemeral_5m_input_tokens")).unwrap_or(0);
-        a + b
-    });
-
-    let input_tokens = safe_i64(
-        usage
-            .and_then(|u| u.get("input_tokens"))
-            .or_else(|| obj.get("input_tokens_cum"))
-            .or_else(|| obj.get("input_tokens")),
-    );
-    let output_tokens = safe_i64(
-        usage
-            .and_then(|u| u.get("output_tokens"))
-            .or_else(|| obj.get("output_tokens_cum"))
-            .or_else(|| obj.get("output_tokens")),
-    );
-    let cache_read_tokens = safe_i64(
-        usage
-            .and_then(|u| u.get("cache_read_input_tokens"))
-            .or_else(|| usage.and_then(|u| u.get("cache_read_tokens")))
-            .or_else(|| obj.get("cache_read_tokens_cum"))
-            .or_else(|| obj.get("cache_read_tokens")),
-    );
-    let cache_write_tokens = safe_i64(
-        usage
-            .and_then(|u| u.get("cache_creation_input_tokens"))
-            .or_else(|| obj.get("cache_write_tokens_cum"))
-            .or_else(|| obj.get("cache_write_tokens")),
-    )
-    .or(cache_creation_sum);
-
-    UsageSample {
-        input_tokens,
-        output_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
-    }
-}
-
-fn line_session_id(obj: &Value) -> Option<String> {
-    obj.get("sessionId")
-        .or_else(|| obj.get("session_id"))
-        .and_then(Value::as_str)
-        .map(|s| s.to_string())
-}
-
-fn event_time_value(obj: &Value) -> Option<String> {
-    if let Some(ts) = obj.get("timestamp") {
-        if let Some(s) = ts.as_str() {
-            return Some(s.to_string());
-        }
-        if let Some(i) = ts.as_i64() {
-            return Some(i.to_string());
-        }
-    }
-    obj.get("created_at")
-        .and_then(Value::as_str)
-        .map(|s| s.to_string())
-        .or_else(|| {
-            obj.get("timestamp")
-                .and_then(Value::as_str)
-                .map(|s| s.to_string())
-        })
-}
-
-fn event_time_epoch(obj: &Value) -> Option<i64> {
-    obj.get("timestamp")
-        .and_then(|v| {
-            v.as_i64()
-                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
-        })
-        .or_else(|| obj.get("created_at").and_then(Value::as_i64))
-}
-
-fn extract_tool_name(obj: &Value) -> String {
-    if let Some(v) = obj.get("tool_name").and_then(Value::as_str) {
-        return v.to_string();
-    }
-    if let Some(v) = obj
-        .get("toolUseResult")
-        .and_then(|t| t.get("commandName"))
-        .and_then(Value::as_str)
-    {
-        return v.to_string();
-    }
-    obj.get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(Value::as_array)
-        .and_then(|arr| {
-            arr.iter().find_map(|item| {
-                if item.get("type").and_then(Value::as_str) == Some("tool_use") {
-                    item.get("name")
-                        .and_then(Value::as_str)
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or_default()
-}
-
-fn extract_plugin_id(obj: &Value, tool_name: &str) -> Option<String> {
-    if let Some(v) = obj.get("plugin_id").and_then(Value::as_str) {
-        if !v.is_empty() {
-            return Some(v.to_string());
-        }
-    }
-    if tool_name == "Skill" {
-        if let Some(skill) = obj
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_array)
-            .and_then(|arr| {
-                arr.iter().find_map(|item| {
-                    if item.get("type").and_then(Value::as_str) == Some("tool_use")
-                        && item.get("name").and_then(Value::as_str) == Some("Skill")
-                    {
-                        item.get("input")
-                            .and_then(|v| v.get("skill"))
-                            .and_then(Value::as_str)
-                            .map(|s| format!("skill:{s}"))
-                    } else {
-                        None
-                    }
-                })
-            })
-        {
-            return Some(skill);
-        }
-    }
-    if tool_name.starts_with("mcp__") {
-        if let Some(server) = extract_mcp_server_name(tool_name) {
-            if server.starts_with("plugin_") {
-                return Some(server);
-            }
-            return Some(format!("mcp:{server}"));
-        }
-        return Some("mcp:unknown".to_string());
-    }
-    if let Some(cmd) = obj
-        .get("toolUseResult")
-        .and_then(|t| t.get("commandName"))
-        .and_then(Value::as_str)
-    {
-        if !cmd.is_empty() {
-            return Some(format!("tool-result:{cmd}"));
-        }
-    }
-    None
-}
-
-fn extract_mcp_server_name(tool_name: &str) -> Option<String> {
-    if !tool_name.starts_with("mcp__") {
-        return None;
-    }
-    let parts: Vec<&str> = tool_name.split("__").collect();
-    if parts.len() >= 2 {
-        return Some(parts[1].to_string());
-    }
-    None
-}
-
-fn extract_hook_name(obj: &Value) -> String {
-    obj.get("hook_event_name")
-        .or_else(|| obj.get("data").and_then(|data| data.get("hookName")))
-        .or_else(|| obj.get("data").and_then(|data| data.get("hookEvent")))
-        .or_else(|| obj.get("subtype"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
 }
 
 fn sql(s: &str) -> String {
@@ -2530,8 +2420,10 @@ mod tests {
         session_id: &str,
         project_root: &Path,
     ) -> IngestSummary {
+        let provider = providers::claude_code::ClaudeCodeProvider;
         ingest_session(
             store,
+            &provider,
             &fixture_path(fixture),
             session_id,
             project_root,
@@ -2552,13 +2444,16 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(extract_prompt_text(&obj), None);
+        let provider = providers::claude_code::ClaudeCodeProvider;
+        let ev = RawEvent::Json(obj);
+        assert_eq!(provider.extract_prompt_text(&ev), None);
     }
 
     #[test]
     fn continuation_summary_detection_matches_compacted_prompt() {
         let text = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.";
-        assert!(continuation_summary_facts(text));
+        let provider = providers::claude_code::ClaudeCodeProvider;
+        assert!(provider.is_continuation_summary(text));
     }
 
     #[test]
@@ -2606,7 +2501,8 @@ mod tests {
             }],
             ..ReportFacts::default()
         };
-        let finding_ids = findings_from_facts(&facts)
+        let provider = providers::claude_code::ClaudeCodeProvider;
+        let finding_ids = findings_from_facts(&provider, &facts)
             .into_iter()
             .map(|finding| finding.id)
             .collect::<Vec<_>>();
@@ -2614,7 +2510,7 @@ mod tests {
         assert!(finding_ids.contains(&"oversized-continuation-summary".to_string()));
         assert!(finding_ids.contains(&"workflow-heavy-session".to_string()));
         assert!(finding_ids.contains(&"low-prompt-count-high-usage".to_string()));
-        let findings = findings_from_facts(&facts);
+        let findings = findings_from_facts(&provider, &facts);
         let recommendation_ids = recommendations_from_findings(&findings)
             .into_iter()
             .map(|recommendation| recommendation.id)
@@ -2633,7 +2529,8 @@ mod tests {
             "continuation-summary-heavy",
             &project_root,
         );
-        let facts = prompt_facts(&store, "continuation-summary-heavy").expect("prompt facts");
+        let provider = providers::claude_code::ClaudeCodeProvider;
+        let facts = prompt_facts(&store, &provider, "continuation-summary-heavy").expect("prompt facts");
         assert_eq!(facts.prompt_count, 2);
         assert_eq!(facts.continuation_summaries.count, 1);
         assert!(facts.continuation_summaries.max_chars >= 3000);
@@ -2712,5 +2609,79 @@ mod tests {
             .map(|finding| get_str(finding, "id"))
             .collect::<Vec<_>>();
         assert!(finding_ids.contains(&"no-token-usage".to_string()));
+    }
+
+    #[test]
+    fn copilot_cli_provider_ingests_events_jsonl() {
+        let (_temp, store) = setup_store();
+        let provider = providers::copilot_cli::CopilotCliProvider;
+        let project_root = PathBuf::from("/tmp/project-copilot");
+        ingest_session(
+            &store,
+            &provider,
+            &fixture_path("copilot-cli/basic.jsonl"),
+            "copilot-basic",
+            &project_root,
+            "main",
+            "claude-sonnet-4.5",
+        )
+        .expect("ingest copilot fixture");
+        let report = summarize_session(&store, "copilot-basic").expect("summarize");
+        assert_eq!(get_str(&report, "provider"), "copilot-cli");
+        let totals = report.get("session_totals").cloned().unwrap_or_else(|| json!({}));
+        assert_eq!(get_i64(&totals, "input_tokens"), 12000);
+        assert_eq!(get_i64(&totals, "output_tokens"), 800);
+        assert_eq!(get_i64(&totals, "cache_read_tokens"), 8500);
+        let tool_names: Vec<String> = report
+            .get("top_sources")
+            .and_then(Value::as_array)
+            .expect("top_sources")
+            .iter()
+            .map(|s| get_str(s, "tool_name"))
+            .collect();
+        assert!(tool_names.iter().any(|n| n == "bash"));
+        let finding_ids: Vec<String> = report
+            .get("findings")
+            .and_then(Value::as_array)
+            .expect("findings")
+            .iter()
+            .map(|f| get_str(f, "id"))
+            .collect();
+        // Copilot lacks per-turn token attribution — sherlock should flag that.
+        assert!(finding_ids
+            .iter()
+            .any(|id| id == "sources-missing-token-attribution"));
+    }
+
+    #[test]
+    fn codex_provider_ingests_rollout_shape() {
+        let (_temp, store) = setup_store();
+        let provider = providers::codex::CodexProvider;
+        let project_root = PathBuf::from("/tmp/project-codex");
+        ingest_session(
+            &store,
+            &provider,
+            &fixture_path("codex/basic.jsonl"),
+            "codex-basic",
+            &project_root,
+            "main",
+            "gpt-5",
+        )
+        .expect("ingest codex fixture");
+        let report = summarize_session(&store, "codex-basic").expect("summarize");
+        assert_eq!(get_str(&report, "provider"), "codex");
+        let totals = report.get("session_totals").cloned().unwrap_or_else(|| json!({}));
+        assert_eq!(get_i64(&totals, "input_tokens"), 14700);
+        assert_eq!(get_i64(&totals, "output_tokens"), 590);
+        assert_eq!(get_i64(&totals, "cache_read_tokens"), 9900);
+        let tool_names: Vec<String> = report
+            .get("top_sources")
+            .and_then(Value::as_array)
+            .expect("top_sources")
+            .iter()
+            .map(|s| get_str(s, "tool_name"))
+            .collect();
+        assert!(tool_names.iter().any(|n| n == "shell"));
+        assert!(tool_names.iter().any(|n| n == "apply_patch"));
     }
 }

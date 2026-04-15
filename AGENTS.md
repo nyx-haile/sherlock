@@ -12,6 +12,14 @@ bd close <id>         # Complete work
 bd dolt push          # Push beads data to remote
 ```
 
+## Adding a provider
+
+Each new provider in `src/providers/` MUST ship with:
+- A fixture under `tests/fixtures/<provider>/basic.jsonl` (or `.json`/`.sqlite`)
+- A regression test in `src/main.rs` that ingests the fixture and asserts non-zero `SessionTotals` plus provider-specific tool/source extraction
+- Registration in `providers::registry()` so auto-detection picks it up
+- Instability warning via `Provider::instability_warning()` if the underlying log format is undocumented or unstable
+
 ## Non-Interactive Shell Commands
 
 **ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
