@@ -187,6 +187,15 @@ enum Cmd {
         session_id: Option<String>,
         #[arg(long, value_enum, default_value_t = ReportFormat::Json)]
         format: ReportFormat,
+        /// Warn if any single plugin exceeds this fraction of session spend (0.0–1.0).
+        #[arg(long)]
+        warn_plugin_share: Option<f64>,
+        /// Warn if any single plugin exceeds this absolute token count.
+        #[arg(long)]
+        warn_plugin_tokens: Option<i64>,
+        /// Exit with code 1 if any warn threshold is breached.
+        #[arg(long, default_value_t = false)]
+        exit_code_on_warn: bool,
     },
     Tui {
         #[arg(long)]
@@ -223,6 +232,23 @@ enum Cmd {
         /// Env var name holding the API key. Defaults per backend.
         #[arg(long)]
         api_key_env: Option<String>,
+    },
+    /// Cross-session rollup — top plugins/tools by total spend across all ingested sessions.
+    Rollup {
+        /// Group by: plugin, tool, provider. Default: plugin.
+        #[arg(long, default_value = "plugin")]
+        group_by: String,
+        /// Only include sessions ingested after this date (ISO 8601, e.g. 2026-04-01).
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter to a specific provider (claude-code, codex, copilot-cli, …).
+        #[arg(long)]
+        provider: Option<String>,
+        /// Number of rows to return.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        #[arg(long, value_enum, default_value_t = ReportFormat::Json)]
+        format: ReportFormat,
     },
     /// Install the bundled Claude Code skill into ~/.claude/skills.
     InstallSkill {
@@ -488,11 +514,31 @@ fn main() -> Result<()> {
             }
             println!("{}", serde_json::to_string(&summary)?);
         }
-        Cmd::Report { session_id, format } => {
+        Cmd::Report {
+            session_id,
+            format,
+            warn_plugin_share,
+            warn_plugin_tokens,
+            exit_code_on_warn,
+        } => {
             let sid = resolve_session_id_with_picker(&store, session_id)?;
             let report = summarize_session(&store, &sid)?;
             let rendered = render_report(&report, format)?;
             println!("{rendered}");
+
+            if warn_plugin_share.is_some() || warn_plugin_tokens.is_some() {
+                let warnings = check_plugin_thresholds(
+                    &report,
+                    warn_plugin_share,
+                    warn_plugin_tokens,
+                );
+                for w in &warnings {
+                    eprintln!("WARN: {w}");
+                }
+                if exit_code_on_warn && !warnings.is_empty() {
+                    std::process::exit(1);
+                }
+            }
         }
         Cmd::Tui { session_id } => {
             let sid = match resolve_session_id_with_picker(&store, session_id) {
@@ -577,6 +623,20 @@ fn main() -> Result<()> {
             let req = analyze::assemble(&reports);
             let out = backend_impl.send(&req)?;
             println!("{}", out);
+        }
+        Cmd::Rollup {
+            group_by,
+            since,
+            provider,
+            top,
+            format,
+        } => {
+            let report = rollup_report(&store, &group_by, since.as_deref(), provider.as_deref(), top)?;
+            let rendered = match format {
+                ReportFormat::Json => serde_json::to_string_pretty(&report)?,
+                ReportFormat::Text | ReportFormat::Markdown => render_rollup_table(&report, &group_by)?,
+            };
+            println!("{rendered}");
         }
         Cmd::InstallSkill { dest, force } => {
             let target = match dest {
@@ -1806,6 +1866,286 @@ fn history_artifact_path(store: &SherlockStore, session_id: &str) -> Result<Opti
         .first()
         .map(|row| PathBuf::from(get_str(row, "path_or_key")))
         .filter(|path| !path.as_os_str().is_empty()))
+}
+
+fn check_plugin_thresholds(
+    report: &Value,
+    share_threshold: Option<f64>,
+    token_threshold: Option<i64>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let plugin_sources = report
+        .get("plugin_sources")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let grand_total = report
+        .get("session_totals")
+        .and_then(|t| t.get("total_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+
+    for src in &plugin_sources {
+        let plugin_id = get_str(src, "plugin_id");
+        if plugin_id.is_empty() {
+            continue;
+        }
+        let est = get_i64(src, "estimated_tokens");
+        if let Some(thresh) = token_threshold {
+            if est > thresh {
+                warnings.push(format!(
+                    "plugin '{}' spent {} tokens (threshold: {})",
+                    plugin_id, est, thresh
+                ));
+            }
+        }
+        if let Some(share) = share_threshold {
+            if grand_total > 0 {
+                let actual_share = est as f64 / grand_total as f64;
+                if actual_share > share {
+                    warnings.push(format!(
+                        "plugin '{}' used {:.1}% of session spend (threshold: {:.1}%)",
+                        plugin_id,
+                        actual_share * 100.0,
+                        share * 100.0
+                    ));
+                }
+            }
+        }
+    }
+
+    // Also check top_sources with non-empty tool names as "plugin-equivalent"
+    // spend when no explicit plugin_id exists.
+    let top_sources = report
+        .get("top_sources")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for src in &top_sources {
+        let plugin_id = get_str(src, "plugin_id");
+        if !plugin_id.is_empty() {
+            continue; // already covered above
+        }
+        let tool = get_str(src, "tool_name");
+        if tool.is_empty() {
+            continue;
+        }
+        let est = get_i64(src, "estimated_tokens");
+        if let Some(thresh) = token_threshold {
+            if est > thresh {
+                warnings.push(format!(
+                    "tool '{}' spent {} tokens (threshold: {})",
+                    tool, est, thresh
+                ));
+            }
+        }
+        if let Some(share) = share_threshold {
+            if grand_total > 0 {
+                let actual_share = est as f64 / grand_total as f64;
+                if actual_share > share {
+                    warnings.push(format!(
+                        "tool '{}' used {:.1}% of session spend (threshold: {:.1}%)",
+                        tool,
+                        actual_share * 100.0,
+                        share * 100.0
+                    ));
+                }
+            }
+        }
+    }
+    warnings
+}
+
+fn rollup_report(
+    store: &SherlockStore,
+    group_by: &str,
+    since: Option<&str>,
+    provider_filter: Option<&str>,
+    top: usize,
+) -> Result<Value> {
+    let group_col = match group_by {
+        "plugin" => "COALESCE(NULLIF(s.plugin_id, ''), NULLIF(s.tool_name, ''), s.source_kind)",
+        "tool" => "COALESCE(NULLIF(s.tool_name, ''), s.source_kind)",
+        "provider" => "COALESCE(sess.provider, 'claude-code')",
+        other => return Err(anyhow!("unknown --group-by value: {other} (expected: plugin, tool, provider)")),
+    };
+
+    let mut wheres: Vec<String> = Vec::new();
+    if let Some(since) = since {
+        wheres.push(format!("sess.started_at >= '{}'", sql(since)));
+    }
+    if let Some(prov) = provider_filter {
+        wheres.push(format!("COALESCE(sess.provider,'claude-code') = '{}'", sql(prov)));
+    }
+    let where_clause = if wheres.is_empty() {
+        String::new()
+    } else {
+        format!("AND {}", wheres.join(" AND "))
+    };
+
+    // Total tokens across all matching sessions (for percentage calculation).
+    let grand_total_rows = store.query_rows(&format!(
+        "SELECT COALESCE(SUM(t.input_tokens_cum + t.output_tokens_cum + t.cache_read_tokens_cum + t.cache_write_tokens_cum), 0) AS grand_total \
+         FROM (SELECT session_id, MAX(input_tokens_cum) AS input_tokens_cum, MAX(output_tokens_cum) AS output_tokens_cum, \
+               MAX(cache_read_tokens_cum) AS cache_read_tokens_cum, MAX(cache_write_tokens_cum) AS cache_write_tokens_cum \
+               FROM turns GROUP BY session_id) t \
+         JOIN sessions sess ON t.session_id = sess.session_id \
+         WHERE 1=1 {where_clause}"
+    ))?;
+    let grand_total = grand_total_rows
+        .first()
+        .map(|r| get_i64(r, "grand_total"))
+        .unwrap_or(0);
+
+    // Per-group rollup: estimate tokens using cumulative-difference method
+    // across all matching sessions, then count events.
+    let query = format!(
+        "SELECT {group_col} AS group_key, \
+         COUNT(*) AS event_count, \
+         COUNT(DISTINCT e.session_id) AS session_count \
+         FROM events e \
+         JOIN sources s ON e.source_id = s.source_id \
+         JOIN sessions sess ON e.session_id = sess.session_id \
+         WHERE 1=1 {where_clause} \
+         GROUP BY group_key \
+         ORDER BY event_count DESC \
+         LIMIT {top}"
+    );
+    let rows = store.query_rows(&query)?;
+
+    // For token estimation we need the source_token_totals path across all
+    // matching sessions.  Build a cross-session source→token map.
+    let token_query = format!(
+        "SELECT {group_col} AS group_key, \
+         e.source_id, t.turn_index, \
+         t.input_tokens_cum, t.output_tokens_cum, \
+         t.cache_read_tokens_cum, t.cache_write_tokens_cum, \
+         e.session_id \
+         FROM events e \
+         JOIN sources s ON e.source_id = s.source_id \
+         JOIN turns t ON e.turn_id = t.turn_id \
+         JOIN sessions sess ON e.session_id = sess.session_id \
+         WHERE 1=1 {where_clause} \
+         ORDER BY e.session_id, t.turn_index ASC"
+    );
+    let token_rows = store.query_rows(&token_query)?;
+
+    // Cumulative-difference per session, then sum into group buckets.
+    let mut group_tokens: HashMap<String, i64> = HashMap::new();
+    let mut prev_total: i64 = 0;
+    let mut prev_session = String::new();
+    for row in &token_rows {
+        let sess = get_str(row, "session_id");
+        if sess != prev_session {
+            prev_total = 0;
+            prev_session = sess;
+        }
+        let total = get_i64(row, "input_tokens_cum")
+            + get_i64(row, "output_tokens_cum")
+            + get_i64(row, "cache_read_tokens_cum")
+            + get_i64(row, "cache_write_tokens_cum");
+        let delta = (total - prev_total).max(0);
+        prev_total = total;
+        let group_key = get_str(row, "group_key");
+        *group_tokens.entry(group_key).or_insert(0) += delta;
+    }
+
+    let mut entries: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let key = get_str(row, "group_key");
+            let estimated_tokens = group_tokens.get(&key).copied().unwrap_or(0);
+            let pct = if grand_total > 0 {
+                (estimated_tokens as f64 * 100.0) / grand_total as f64
+            } else {
+                0.0
+            };
+            json!({
+                "group": key,
+                "estimated_tokens": estimated_tokens,
+                "estimated_pct": (pct * 100.0).round() / 100.0,
+                "event_count": get_i64(row, "event_count"),
+                "session_count": get_i64(row, "session_count"),
+            })
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        get_i64(b, "estimated_tokens")
+            .cmp(&get_i64(a, "estimated_tokens"))
+            .then_with(|| get_i64(b, "event_count").cmp(&get_i64(a, "event_count")))
+    });
+    entries.truncate(top);
+
+    let session_count_rows = store.query_rows(&format!(
+        "SELECT COUNT(*) AS c FROM sessions sess WHERE 1=1 {where_clause}"
+    ))?;
+    let total_sessions = session_count_rows
+        .first()
+        .map(|r| get_i64(r, "c"))
+        .unwrap_or(0);
+
+    Ok(json!({
+        "group_by": group_by,
+        "since": since,
+        "provider_filter": provider_filter,
+        "total_sessions": total_sessions,
+        "grand_total_tokens": grand_total,
+        "entries": entries,
+    }))
+}
+
+fn render_rollup_table(report: &Value, group_by: &str) -> Result<String> {
+    let entries = report
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("missing entries in rollup report"))?;
+    let total_sessions = get_i64(report, "total_sessions");
+    let grand_total = get_i64(report, "grand_total_tokens");
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Rollup by {group_by} — {total_sessions} sessions, {grand_total} total tokens\n"
+    ));
+    if let Some(since) = report.get("since").and_then(Value::as_str) {
+        out.push_str(&format!("Since: {since}\n"));
+    }
+    if let Some(prov) = report.get("provider_filter").and_then(Value::as_str) {
+        out.push_str(&format!("Provider: {prov}\n"));
+    }
+    out.push('\n');
+
+    let col_w = entries
+        .iter()
+        .map(|e| get_str(e, "group").len())
+        .max()
+        .unwrap_or(10)
+        .max(group_by.len())
+        .min(60);
+    out.push_str(&format!(
+        "{:<col_w$}  {:>14}  {:>7}  {:>8}  {:>8}\n",
+        group_by, "tokens", "pct", "events", "sessions"
+    ));
+    out.push_str(&format!(
+        "{:-<col_w$}  {:->14}  {:->7}  {:->8}  {:->8}\n",
+        "", "", "", "", ""
+    ));
+    for entry in entries {
+        let group = get_str(entry, "group");
+        let display = if group.len() > col_w {
+            format!("{}…", &group[..col_w - 1])
+        } else {
+            group
+        };
+        out.push_str(&format!(
+            "{:<col_w$}  {:>14}  {:>6.1}%  {:>8}  {:>8}\n",
+            display,
+            get_i64(entry, "estimated_tokens"),
+            get_f64(entry, "estimated_pct"),
+            get_i64(entry, "event_count"),
+            get_i64(entry, "session_count"),
+        ));
+    }
+    Ok(out)
 }
 
 fn workflow_tool_tokens(provider: &dyn Provider, sources: &[SourceFact]) -> i64 {
