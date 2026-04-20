@@ -1,5 +1,6 @@
 mod analyze;
 mod install_skill;
+mod live;
 mod providers;
 
 use anyhow::{anyhow, Context, Result};
@@ -277,6 +278,25 @@ enum Cmd {
         commit: bool,
         #[arg(long, value_enum, default_value_t = ReportFormat::Markdown)]
         format: ReportFormat,
+    },
+    /// Live Claude Code quota snapshot via `GET /api/oauth/usage` — the
+    /// authoritative data surfaced by Claude Code's `/usage`. Reads
+    /// `~/.claude/.credentials.json`, caches the response for 60s.
+    Quota {
+        /// Source. Only `claude-code` is wired up today.
+        #[arg(long, default_value = "claude-code")]
+        provider: String,
+        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+        format: ReportFormat,
+        /// Bypass the 60s cache and hit the API every time.
+        #[arg(long, default_value_t = false)]
+        no_cache: bool,
+        /// Override credentials path (default: ~/.claude/.credentials.json).
+        #[arg(long)]
+        credentials: Option<PathBuf>,
+        /// Override cache TTL in seconds.
+        #[arg(long, default_value_t = 60)]
+        cache_ttl: u64,
     },
     /// Install the bundled Claude Code skill into ~/.claude/skills.
     InstallSkill {
@@ -703,6 +723,29 @@ fn main() -> Result<()> {
                 ReportFormat::Json => serde_json::to_string_pretty(&report)?,
                 ReportFormat::Text | ReportFormat::Markdown => render_headline_markdown(&report)?,
             };
+            println!("{rendered}");
+        }
+        Cmd::Quota {
+            provider,
+            format,
+            no_cache,
+            credentials,
+            cache_ttl,
+        } => {
+            if provider != "claude-code" {
+                return Err(anyhow!(
+                    "quota: only provider `claude-code` is supported today (got `{}`)",
+                    provider
+                ));
+            }
+            let mut opts = live::claude_code_oauth::FetchOptions::defaults()?;
+            if let Some(path) = credentials {
+                opts.credentials_path = path;
+            }
+            opts.use_cache = !no_cache;
+            opts.cache_ttl_secs = cache_ttl;
+            let snapshot = live::claude_code_oauth::fetch_quota(&opts)?;
+            let rendered = render_quota(&snapshot, format)?;
             println!("{rendered}");
         }
         Cmd::InstallSkill { dest, force } => {
@@ -3355,6 +3398,148 @@ fn render_headline_markdown(report: &Value) -> Result<String> {
     }
 
     Ok(out)
+}
+
+fn render_quota(snapshot: &live::claude_code_oauth::QuotaSnapshot, format: ReportFormat) -> Result<String> {
+    match format {
+        ReportFormat::Json => Ok(serde_json::to_string_pretty(snapshot)?),
+        ReportFormat::Markdown => render_quota_markdown(snapshot),
+        ReportFormat::Text => render_quota_text(snapshot),
+    }
+}
+
+fn render_quota_text(snapshot: &live::claude_code_oauth::QuotaSnapshot) -> Result<String> {
+    let mut out = String::new();
+    let source = if snapshot.cached {
+        match snapshot.cache_age_secs {
+            Some(age) => format!("cached {age}s ago"),
+            None => "cached".to_string(),
+        }
+    } else {
+        "live".to_string()
+    };
+    writeln!(
+        out,
+        "Claude Code quota  (provider={}, fetched {} — {})",
+        snapshot.provider, snapshot.fetched_at, source
+    )?;
+    if snapshot.subscription_type.is_some() || snapshot.rate_limit_tier.is_some() {
+        writeln!(
+            out,
+            "  plan: {}  tier: {}",
+            snapshot.subscription_type.as_deref().unwrap_or("—"),
+            snapshot.rate_limit_tier.as_deref().unwrap_or("—"),
+        )?;
+    }
+    writeln!(out)?;
+    write_window_line(&mut out, "5-hour window  ", snapshot.five_hour.as_ref())?;
+    write_window_line(&mut out, "7-day window   ", snapshot.seven_day.as_ref())?;
+    write_window_line(&mut out, "7d  Opus       ", snapshot.seven_day_opus.as_ref())?;
+    write_window_line(&mut out, "7d  Sonnet     ", snapshot.seven_day_sonnet.as_ref())?;
+    write_window_line(&mut out, "7d  Cowork     ", snapshot.seven_day_cowork.as_ref())?;
+    write_window_line(&mut out, "7d  OAuth apps ", snapshot.seven_day_oauth_apps.as_ref())?;
+    write_window_line(&mut out, "7d  Omelette   ", snapshot.seven_day_omelette.as_ref())?;
+    if let Some(extra) = snapshot.extra_usage.as_ref() {
+        writeln!(out)?;
+        writeln!(
+            out,
+            "Pay-as-you-go ({}): enabled={} used={} limit={} util={:.1}%",
+            if extra.currency.is_empty() { "USD" } else { &extra.currency },
+            extra.is_enabled,
+            extra.used_credits.map(|c| format!("{c:.2}")).unwrap_or_else(|| "—".into()),
+            extra.monthly_limit.map(|c| format!("{c:.0}")).unwrap_or_else(|| "—".into()),
+            extra.utilization,
+        )?;
+    }
+    Ok(out)
+}
+
+fn render_quota_markdown(snapshot: &live::claude_code_oauth::QuotaSnapshot) -> Result<String> {
+    let mut out = String::new();
+    writeln!(out, "# Claude Code quota")?;
+    writeln!(out)?;
+    writeln!(out, "- provider: `{}`", snapshot.provider)?;
+    writeln!(out, "- fetched: `{}`", snapshot.fetched_at)?;
+    if let Some(plan) = snapshot.subscription_type.as_deref() {
+        writeln!(out, "- plan: `{plan}`")?;
+    }
+    if let Some(tier) = snapshot.rate_limit_tier.as_deref() {
+        writeln!(out, "- tier: `{tier}`")?;
+    }
+    writeln!(
+        out,
+        "- source: {}",
+        if snapshot.cached {
+            match snapshot.cache_age_secs {
+                Some(age) => format!("cached ({age}s old)"),
+                None => "cached".into(),
+            }
+        } else {
+            "live".into()
+        }
+    )?;
+    writeln!(out)?;
+    writeln!(out, "| Window | Utilization | Resets at |")?;
+    writeln!(out, "|--------|-------------|-----------|")?;
+    for (label, w) in [
+        ("5-hour", snapshot.five_hour.as_ref()),
+        ("7-day", snapshot.seven_day.as_ref()),
+        ("7d Opus", snapshot.seven_day_opus.as_ref()),
+        ("7d Sonnet", snapshot.seven_day_sonnet.as_ref()),
+        ("7d Cowork", snapshot.seven_day_cowork.as_ref()),
+        ("7d OAuth apps", snapshot.seven_day_oauth_apps.as_ref()),
+        ("7d Omelette", snapshot.seven_day_omelette.as_ref()),
+    ] {
+        match w {
+            Some(win) => writeln!(
+                out,
+                "| {label} | {:.1}% | {} |",
+                win.utilization,
+                win.resets_at.as_deref().unwrap_or("—")
+            )?,
+            None => writeln!(out, "| {label} | — | — |")?,
+        }
+    }
+    if let Some(extra) = snapshot.extra_usage.as_ref() {
+        writeln!(out)?;
+        writeln!(out, "## Pay-as-you-go")?;
+        writeln!(out)?;
+        writeln!(out, "- enabled: `{}`", extra.is_enabled)?;
+        writeln!(
+            out,
+            "- used credits: {}",
+            extra.used_credits.map(|c| format!("{c:.2}")).unwrap_or_else(|| "—".into())
+        )?;
+        writeln!(
+            out,
+            "- monthly limit: {}",
+            extra.monthly_limit.map(|c| format!("{c:.0}")).unwrap_or_else(|| "—".into())
+        )?;
+        writeln!(out, "- utilization: {:.1}%", extra.utilization)?;
+        writeln!(
+            out,
+            "- currency: `{}`",
+            if extra.currency.is_empty() { "USD" } else { &extra.currency }
+        )?;
+    }
+    Ok(out)
+}
+
+fn write_window_line(
+    out: &mut String,
+    label: &str,
+    window: Option<&live::claude_code_oauth::QuotaWindow>,
+) -> Result<()> {
+    match window {
+        Some(w) => writeln!(
+            out,
+            "  {label} {:>6.1}%   resets {}",
+            w.utilization,
+            w.resets_at.as_deref().unwrap_or("—")
+        )?,
+        None => writeln!(out, "  {label}     —")?,
+    }
+    Ok(())
 }
 
 fn git_branch(cwd: &Path) -> Option<String> {
