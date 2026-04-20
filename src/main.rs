@@ -250,6 +250,34 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = ReportFormat::Json)]
         format: ReportFormat,
     },
+    /// One-command multi-repo Claude Code usage report: discover modified repos,
+    /// ingest their Claude Code history in a time window, render per-repo totals.
+    Headline {
+        /// Roots to scan for modified git repos (comma-separated). Defaults to cwd.
+        #[arg(long, value_delimiter = ',')]
+        roots: Vec<PathBuf>,
+        /// Only include repos with git activity since this date
+        /// (ISO 8601, `Nd`/`Nw`/`Nh`, `today`/`yesterday`, weekday name).
+        #[arg(long, default_value = "7d")]
+        modified_since: String,
+        /// Only include usage since this date. Defaults to --modified-since.
+        #[arg(long)]
+        window_since: Option<String>,
+        /// Provider id (default: claude-code).
+        #[arg(long, default_value = "claude-code")]
+        provider: String,
+        /// Top N sources per repo.
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        /// Skip ingest of newly discovered history files.
+        #[arg(long, default_value_t = false)]
+        skip_ingest: bool,
+        /// Commit new ingests to the Dolt repo.
+        #[arg(long, default_value_t = false)]
+        commit: bool,
+        #[arg(long, value_enum, default_value_t = ReportFormat::Markdown)]
+        format: ReportFormat,
+    },
     /// Install the bundled Claude Code skill into ~/.claude/skills.
     InstallSkill {
         /// Destination directory (default: ~/.claude/skills/sherlock-analyze)
@@ -635,6 +663,45 @@ fn main() -> Result<()> {
             let rendered = match format {
                 ReportFormat::Json => serde_json::to_string_pretty(&report)?,
                 ReportFormat::Text | ReportFormat::Markdown => render_rollup_table(&report, &group_by)?,
+            };
+            println!("{rendered}");
+        }
+        Cmd::Headline {
+            roots,
+            modified_since,
+            window_since,
+            provider,
+            top,
+            skip_ingest,
+            commit,
+            format,
+        } => {
+            store.init()?;
+            let roots_resolved = if roots.is_empty() {
+                vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))]
+            } else {
+                roots
+            };
+            let (mod_iso, mod_epoch) = parse_since_expr(&modified_since)?;
+            let (win_iso, win_epoch) = match window_since.as_deref() {
+                Some(s) => parse_since_expr(s)?,
+                None => (mod_iso.clone(), mod_epoch),
+            };
+            let report = headline_report(
+                &store,
+                &roots_resolved,
+                &mod_iso,
+                mod_epoch,
+                &win_iso,
+                win_epoch,
+                &provider,
+                top,
+                skip_ingest,
+                commit,
+            )?;
+            let rendered = match format {
+                ReportFormat::Json => serde_json::to_string_pretty(&report)?,
+                ReportFormat::Text | ReportFormat::Markdown => render_headline_markdown(&report)?,
             };
             println!("{rendered}");
         }
@@ -1970,12 +2037,30 @@ fn rollup_report(
         other => return Err(anyhow!("unknown --group-by value: {other} (expected: plugin, tool, provider)")),
     };
 
+    // Resolve sessions via a robust timestamp check (sherlock-ed0): compare
+    // started_at, ended_at, latest windows.end_time, and latest event_time with
+    // parse_ts_epoch so malformed iso_now() legacy strings still filter right.
     let mut wheres: Vec<String> = Vec::new();
-    if let Some(since) = since {
-        wheres.push(format!("sess.started_at >= '{}'", sql(since)));
-    }
     if let Some(prov) = provider_filter {
-        wheres.push(format!("COALESCE(sess.provider,'claude-code') = '{}'", sql(prov)));
+        wheres.push(format!(
+            "COALESCE(sess.provider,'claude-code') = '{}'",
+            sql(prov)
+        ));
+    }
+    if since.is_some() {
+        let (_, since_epoch) = parse_since_expr(since.unwrap())?;
+        let ids = session_ids_in_window(store, None, provider_filter, since_epoch)?;
+        if ids.is_empty() {
+            return Ok(json!({
+                "group_by": group_by,
+                "since": since,
+                "provider_filter": provider_filter,
+                "total_sessions": 0,
+                "grand_total_tokens": 0,
+                "entries": [],
+            }));
+        }
+        wheres.push(format!("sess.session_id IN ({})", sql_in_list(&ids)));
     }
     let where_clause = if wheres.is_empty() {
         String::new()
@@ -2662,14 +2747,614 @@ fn new_session_id() -> String {
 }
 
 fn iso_now() -> String {
-    // Keep RFC3339-like shape for SQL text sorting and consistency.
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // Minimal timestamp for deterministic storage without extra deps
-    format!("{}Z", now)
+    // Proper RFC3339/ISO8601 so lexicographic string compares in SQL line up
+    // with wall-clock order (the old epoch-seconds+Z form broke `>=` filters
+    // against ISO-formatted thresholds — see bug sherlock-ed0).
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Parse a timestamp value (from session.started_at/ended_at, event_time,
+/// windows.*_time) into epoch seconds. Tolerates:
+/// - RFC3339 ("2026-04-20T01:02:03Z", with or without fractional seconds)
+/// - Legacy Sherlock epoch-Z form ("1776361213Z")
+/// - Bare integer strings ("1776361213")
+/// - Millisecond epochs (auto-detected by magnitude, divided by 1000)
+/// Returns None when nothing parseable remains.
+fn parse_ts_epoch(s: &str) -> Option<i64> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let stripped = trimmed.trim_end_matches('Z');
+    if let Ok(n) = stripped.parse::<i64>() {
+        // Heuristic: anything > ~11 digits is ms-since-epoch, not seconds.
+        let normalized = if n > 9_999_999_999 { n / 1000 } else { n };
+        return Some(normalized);
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Some(dt.timestamp());
+    }
+    for fmt in &["%Y-%m-%dT%H:%M:%S%.fZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"] {
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(trimmed, fmt) {
+            return Some(ndt.and_utc().timestamp());
+        }
+        if let Ok(nd) = chrono::NaiveDate::parse_from_str(trimmed, fmt) {
+            if let Some(ndt) = nd.and_hms_opt(0, 0, 0) {
+                return Some(ndt.and_utc().timestamp());
+            }
+        }
+    }
+    None
+}
+
+/// Parse a user-supplied `--since`/`--modified-since` expression into
+/// (canonical ISO8601, epoch seconds). Accepts:
+/// - ISO date (2026-04-16) or full RFC3339
+/// - Relative: `today`, `yesterday`, `Nd`/`Nw`/`Nh`/`Nm` (e.g. `7d`, `2w`)
+/// - Weekday names: `sunday`..`saturday` (most recent past occurrence,
+///   inclusive of today if today matches)
+fn parse_since_expr(expr: &str) -> Result<(String, i64)> {
+    let raw = expr.trim().to_lowercase();
+    let now = chrono::Utc::now();
+    let today = now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+
+    let resolved: chrono::DateTime<chrono::Utc> = match raw.as_str() {
+        "today" | "now" => today,
+        "yesterday" => today - chrono::Duration::days(1),
+        s if s.ends_with('d') => {
+            let n: i64 = s.trim_end_matches('d').parse()
+                .map_err(|_| anyhow!("bad --since days: {expr}"))?;
+            now - chrono::Duration::days(n)
+        }
+        s if s.ends_with('w') => {
+            let n: i64 = s.trim_end_matches('w').parse()
+                .map_err(|_| anyhow!("bad --since weeks: {expr}"))?;
+            now - chrono::Duration::weeks(n)
+        }
+        s if s.ends_with('h') => {
+            let n: i64 = s.trim_end_matches('h').parse()
+                .map_err(|_| anyhow!("bad --since hours: {expr}"))?;
+            now - chrono::Duration::hours(n)
+        }
+        s if s.ends_with('m')
+            && s.trim_end_matches('m').chars().all(|c| c.is_ascii_digit()) =>
+        {
+            let n: i64 = s.trim_end_matches('m').parse()
+                .map_err(|_| anyhow!("bad --since minutes: {expr}"))?;
+            now - chrono::Duration::minutes(n)
+        }
+        s => {
+            let weekday = match s {
+                "sunday" | "sun" => Some(chrono::Weekday::Sun),
+                "monday" | "mon" => Some(chrono::Weekday::Mon),
+                "tuesday" | "tue" | "tues" => Some(chrono::Weekday::Tue),
+                "wednesday" | "wed" => Some(chrono::Weekday::Wed),
+                "thursday" | "thu" | "thur" | "thurs" => Some(chrono::Weekday::Thu),
+                "friday" | "fri" => Some(chrono::Weekday::Fri),
+                "saturday" | "sat" => Some(chrono::Weekday::Sat),
+                _ => None,
+            };
+            if let Some(wd) = weekday {
+                use chrono::Datelike;
+                let today_wd = today.weekday().num_days_from_monday() as i64;
+                let want_wd = wd.num_days_from_monday() as i64;
+                let delta = ((today_wd - want_wd) + 7) % 7;
+                today - chrono::Duration::days(delta)
+            } else if let Some(ts) = parse_ts_epoch(s) {
+                chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+                    .ok_or_else(|| anyhow!("bad --since timestamp: {expr}"))?
+            } else {
+                return Err(anyhow!(
+                    "unrecognized --since value `{expr}` (try YYYY-MM-DD, 7d, sunday, yesterday)"
+                ));
+            }
+        }
+    };
+    Ok((
+        resolved.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        resolved.timestamp(),
+    ))
+}
+
+/// Walk a root looking for `.git` directories, bounded in depth. Skips common
+/// vendored trees so big monorepos stay snappy.
+fn find_git_repos(root: &Path, max_depth: usize) -> Vec<PathBuf> {
+    let skip: &[&str] = &[
+        "node_modules", "target", ".cargo", ".venv", "venv", "__pycache__",
+        "dist", "build", ".next", ".nuxt", ".pnpm-store", ".yarn",
+    ];
+    let mut out = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if dir.join(".git").exists() {
+            out.push(dir);
+            continue;
+        }
+        if depth >= max_depth {
+            continue;
+        }
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name.starts_with('.') && name != "." && name != ".." {
+                continue;
+            }
+            if skip.contains(&name) {
+                continue;
+            }
+            stack.push((path, depth + 1));
+        }
+    }
+    out
+}
+
+/// A git repo is "modified since X" if it has commits since X (on any ref) OR
+/// a non-empty working tree. Cheap: two `git` calls.
+fn repo_modified_since(repo: &Path, since_iso: &str) -> bool {
+    // --all: consider every local ref, not just HEAD.
+    let log = Command::new("git")
+        .args([
+            "-C",
+            repo.to_string_lossy().as_ref(),
+            "log",
+            "--all",
+            "--since",
+            since_iso,
+            "--format=%H",
+            "-n",
+            "1",
+        ])
+        .output();
+    if let Ok(out) = log {
+        if out.status.success() && !out.stdout.trim_ascii().is_empty() {
+            return true;
+        }
+    }
+    let status = Command::new("git")
+        .args([
+            "-C",
+            repo.to_string_lossy().as_ref(),
+            "status",
+            "--porcelain",
+        ])
+        .output();
+    if let Ok(out) = status {
+        if out.status.success() && !out.stdout.trim_ascii().is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+/// All repos under the given roots that have activity since `since_iso`.
+/// Deduplicated and canonicalized.
+fn discover_modified_repos(roots: &[PathBuf], since_iso: &str) -> Vec<PathBuf> {
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let expanded = if root.starts_with("~") {
+            let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+            let rest: PathBuf = root.strip_prefix("~").unwrap_or(root).to_path_buf();
+            home.join(rest)
+        } else {
+            root.clone()
+        };
+        for repo in find_git_repos(&expanded, 4) {
+            let canon = repo.canonicalize().unwrap_or(repo);
+            if !seen.insert(canon.clone()) {
+                continue;
+            }
+            if repo_modified_since(&canon, since_iso) {
+                out.push(canon);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// List Claude Code JSONL history files for a given project_root, filtered by
+/// file mtime >= since_epoch. Returns in deterministic order.
+fn repo_history_files(project_root: &Path, since_epoch: i64) -> Vec<PathBuf> {
+    let dir = default_projects_root().join(project_key(project_root));
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let mtime_epoch = fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if mtime_epoch >= since_epoch {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Pick session_ids for a given project_root that fall inside the window, using
+/// a robust timestamp check: compare started_at, ended_at, and the max
+/// windows.end_time with parse_ts_epoch. This is what makes the filter tolerant
+/// of malformed session timestamps (sherlock-ed0).
+fn session_ids_in_window(
+    store: &SherlockStore,
+    project_root: Option<&Path>,
+    provider: Option<&str>,
+    since_epoch: i64,
+) -> Result<Vec<String>> {
+    let mut wheres: Vec<String> = Vec::new();
+    if let Some(root) = project_root {
+        wheres.push(format!(
+            "s.project_root = '{}'",
+            sql(&root.to_string_lossy())
+        ));
+    }
+    if let Some(prov) = provider {
+        wheres.push(format!(
+            "COALESCE(s.provider,'claude-code') = '{}'",
+            sql(prov)
+        ));
+    }
+    let where_clause = if wheres.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", wheres.join(" AND "))
+    };
+    let rows = store.query_rows(&format!(
+        "SELECT s.session_id, s.started_at, s.ended_at, \
+         (SELECT MAX(w.end_time) FROM windows w WHERE w.session_id = s.session_id) AS max_window_end, \
+         (SELECT MAX(e.event_time) FROM events e WHERE e.session_id = s.session_id) AS max_event_time \
+         FROM sessions s {where_clause}"
+    ))?;
+    let mut out: Vec<String> = Vec::new();
+    for row in rows {
+        let candidates = [
+            get_str(&row, "started_at"),
+            get_str(&row, "ended_at"),
+            get_str(&row, "max_window_end"),
+            get_str(&row, "max_event_time"),
+        ];
+        let best = candidates
+            .iter()
+            .filter_map(|s| parse_ts_epoch(s))
+            .max();
+        if let Some(ts) = best {
+            if ts >= since_epoch {
+                out.push(get_str(&row, "session_id"));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn sql_in_list(ids: &[String]) -> String {
+    if ids.is_empty() {
+        return "''".to_string();
+    }
+    ids.iter()
+        .map(|s| format!("'{}'", sql(s)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn headline_report(
+    store: &SherlockStore,
+    roots: &[PathBuf],
+    modified_since_iso: &str,
+    _modified_since_epoch: i64,
+    window_since_iso: &str,
+    window_since_epoch: i64,
+    provider: &str,
+    top: usize,
+    skip_ingest: bool,
+    commit: bool,
+) -> Result<Value> {
+    let repos = discover_modified_repos(roots, modified_since_iso);
+    let mut ingest_errors: Vec<String> = Vec::new();
+    let mut ingested_files: usize = 0;
+
+    if !skip_ingest {
+        let provider_box: Box<dyn Provider> = providers::by_id(provider)
+            .ok_or_else(|| anyhow!("unknown provider: {provider}"))?;
+        for repo in &repos {
+            for hist in repo_history_files(repo, window_since_epoch) {
+                let sha = sha256_hex(&fs::read_to_string(&hist).unwrap_or_default());
+                let already = store
+                    .query_rows(&format!(
+                        "SELECT sha256 FROM artifacts WHERE path_or_key='{}' AND sha256='{}' LIMIT 1",
+                        sql(&hist.to_string_lossy()),
+                        sql(&sha)
+                    ))
+                    .unwrap_or_default();
+                if !already.is_empty() {
+                    continue;
+                }
+                let sid = match resolve_ingest_session_id(&*provider_box, &hist, None) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        ingest_errors.push(format!("{}: {}", hist.display(), e));
+                        continue;
+                    }
+                };
+                let branch = git_branch(repo).unwrap_or_default();
+                match ingest_session(
+                    store,
+                    &*provider_box,
+                    &hist,
+                    &sid,
+                    repo,
+                    &branch,
+                    "",
+                ) {
+                    Ok(_) => ingested_files += 1,
+                    Err(e) => ingest_errors.push(format!("{}: {}", hist.display(), e)),
+                }
+            }
+        }
+        if commit && ingested_files > 0 {
+            store.commit(&format!(
+                "sherlock: headline ingest ({} files)",
+                ingested_files
+            ))?;
+        }
+    }
+
+    let mut repo_entries: Vec<Value> = Vec::new();
+    let mut global_total: i64 = 0;
+    let mut global_input: i64 = 0;
+    let mut global_output: i64 = 0;
+    let mut global_cache_read: i64 = 0;
+    let mut global_cache_write: i64 = 0;
+    let mut repos_with_usage: i64 = 0;
+    let mut total_malformed_ts: i64 = 0;
+
+    for repo in &repos {
+        let session_ids =
+            session_ids_in_window(store, Some(repo), Some(provider), window_since_epoch)?;
+        if session_ids.is_empty() {
+            repo_entries.push(json!({
+                "project_root": repo.display().to_string(),
+                "sessions_in_window": 0,
+                "total_tokens": 0,
+                "top_sources": [],
+            }));
+            continue;
+        }
+        repos_with_usage += 1;
+        let in_list = sql_in_list(&session_ids);
+
+        let malformed_count = store
+            .query_rows(&format!(
+                "SELECT COUNT(*) AS c FROM sessions WHERE session_id IN ({in_list}) \
+                 AND (started_at IS NULL OR started_at NOT LIKE '____-__-__T%')"
+            ))
+            .ok()
+            .and_then(|r| r.first().map(|row| get_i64(row, "c")))
+            .unwrap_or(0);
+        total_malformed_ts += malformed_count;
+
+        let totals_rows = store.query_rows(&format!(
+            "SELECT \
+             COALESCE(SUM(mi.input_tokens_cum),0) AS input_tokens, \
+             COALESCE(SUM(mi.output_tokens_cum),0) AS output_tokens, \
+             COALESCE(SUM(mi.cache_read_tokens_cum),0) AS cache_read_tokens, \
+             COALESCE(SUM(mi.cache_write_tokens_cum),0) AS cache_write_tokens \
+             FROM (SELECT session_id, \
+                   MAX(input_tokens_cum) AS input_tokens_cum, \
+                   MAX(output_tokens_cum) AS output_tokens_cum, \
+                   MAX(cache_read_tokens_cum) AS cache_read_tokens_cum, \
+                   MAX(cache_write_tokens_cum) AS cache_write_tokens_cum \
+                   FROM turns WHERE session_id IN ({in_list}) \
+                   GROUP BY session_id) mi"
+        ))?;
+        let totals = totals_rows.first().cloned().unwrap_or_else(|| json!({}));
+        let input = get_i64(&totals, "input_tokens");
+        let output = get_i64(&totals, "output_tokens");
+        let cache_read = get_i64(&totals, "cache_read_tokens");
+        let cache_write = get_i64(&totals, "cache_write_tokens");
+        let total = input + output + cache_read + cache_write;
+        global_total += total;
+        global_input += input;
+        global_output += output;
+        global_cache_read += cache_read;
+        global_cache_write += cache_write;
+
+        let source_rows = store.query_rows(&format!(
+            "SELECT COALESCE(NULLIF(s.plugin_id,''), NULLIF(s.tool_name,''), s.source_kind) AS group_key, \
+             COUNT(*) AS event_count \
+             FROM events e JOIN sources s ON e.source_id = s.source_id \
+             WHERE e.session_id IN ({in_list}) \
+             GROUP BY group_key ORDER BY event_count DESC LIMIT {top}"
+        ))?;
+        let top_sources: Vec<Value> = source_rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "key": get_str(r, "group_key"),
+                    "event_count": get_i64(r, "event_count"),
+                })
+            })
+            .collect();
+
+        let cache_read_pct = if total > 0 {
+            (cache_read as f64 * 100.0 / total as f64 * 100.0).round() / 100.0
+        } else {
+            0.0
+        };
+        let cache_write_pct = if total > 0 {
+            (cache_write as f64 * 100.0 / total as f64 * 100.0).round() / 100.0
+        } else {
+            0.0
+        };
+
+        repo_entries.push(json!({
+            "project_root": repo.display().to_string(),
+            "sessions_in_window": session_ids.len(),
+            "total_tokens": total,
+            "input_tokens": input,
+            "output_tokens": output,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+            "cache_read_pct": cache_read_pct,
+            "cache_write_pct": cache_write_pct,
+            "top_sources": top_sources,
+            "malformed_session_timestamps": malformed_count,
+        }));
+    }
+
+    repo_entries.sort_by(|a, b| get_i64(b, "total_tokens").cmp(&get_i64(a, "total_tokens")));
+
+    let mut caveats: Vec<String> = Vec::new();
+    if total_malformed_ts > 0 {
+        caveats.push(format!(
+            "{} session(s) had malformed started_at; included via windows/events fallback",
+            total_malformed_ts
+        ));
+    }
+    if !ingest_errors.is_empty() {
+        caveats.push(format!("{} ingest error(s) — see ingest_errors", ingest_errors.len()));
+    }
+
+    Ok(json!({
+        "generated_at": iso_now(),
+        "provider": provider,
+        "modified_since": modified_since_iso,
+        "window_since": window_since_iso,
+        "roots": roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "repos": repo_entries,
+        "global": {
+            "repos_discovered": repos.len(),
+            "repos_with_usage": repos_with_usage,
+            "repos_without_usage": repos.len() as i64 - repos_with_usage,
+            "total_tokens": global_total,
+            "input_tokens": global_input,
+            "output_tokens": global_output,
+            "cache_read_tokens": global_cache_read,
+            "cache_write_tokens": global_cache_write,
+        },
+        "ingested_files": ingested_files,
+        "ingest_errors": ingest_errors,
+        "caveats": caveats,
+    }))
+}
+
+fn render_headline_markdown(report: &Value) -> Result<String> {
+    let mut out = String::new();
+    let generated = get_str(report, "generated_at");
+    let provider = get_str(report, "provider");
+    let modified_since = get_str(report, "modified_since");
+    let window_since = get_str(report, "window_since");
+    writeln!(out, "# Sherlock Headline Report")?;
+    writeln!(out)?;
+    writeln!(out, "- generated: `{generated}`")?;
+    writeln!(out, "- provider: `{provider}`")?;
+    writeln!(out, "- modified since: `{modified_since}`")?;
+    writeln!(out, "- window since: `{window_since}`")?;
+    if let Some(roots) = report.get("roots").and_then(|v| v.as_array()) {
+        let list = roots
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(out, "- roots: {list}")?;
+    }
+
+    let global = report.get("global").cloned().unwrap_or_else(|| json!({}));
+    writeln!(out)?;
+    writeln!(out, "## Global")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "- repos discovered: {}",
+        get_i64(&global, "repos_discovered")
+    )?;
+    writeln!(
+        out,
+        "- repos with usage: {}",
+        get_i64(&global, "repos_with_usage")
+    )?;
+    writeln!(
+        out,
+        "- repos without usage: {}",
+        get_i64(&global, "repos_without_usage")
+    )?;
+    writeln!(
+        out,
+        "- total tokens: {}",
+        get_i64(&global, "total_tokens")
+    )?;
+    writeln!(
+        out,
+        "  - input: {}, output: {}, cache_read: {}, cache_write: {}",
+        get_i64(&global, "input_tokens"),
+        get_i64(&global, "output_tokens"),
+        get_i64(&global, "cache_read_tokens"),
+        get_i64(&global, "cache_write_tokens"),
+    )?;
+
+    writeln!(out)?;
+    writeln!(out, "## Per-Repo")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "| Repo | Sessions | Total | Cache-Read % | Top Source |"
+    )?;
+    writeln!(out, "|------|----------|-------|--------------|------------|")?;
+    if let Some(repos) = report.get("repos").and_then(|v| v.as_array()) {
+        for repo in repos {
+            let root = get_str(repo, "project_root");
+            let sessions = get_i64(repo, "sessions_in_window");
+            let total = get_i64(repo, "total_tokens");
+            let cr_pct = repo
+                .get("cache_read_pct")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let top_source = repo
+                .get("top_sources")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .map(|v| get_str(v, "key"))
+                .unwrap_or_default();
+            writeln!(
+                out,
+                "| `{root}` | {sessions} | {total} | {cr_pct:.2} | {top_source} |"
+            )?;
+        }
+    }
+
+    let caveats = report
+        .get("caveats")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if !caveats.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "## Caveats")?;
+        writeln!(out)?;
+        for c in caveats {
+            if let Some(s) = c.as_str() {
+                writeln!(out, "- {s}")?;
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 fn git_branch(cwd: &Path) -> Option<String> {
@@ -3023,5 +3708,124 @@ mod tests {
             .collect();
         assert!(tool_names.iter().any(|n| n == "shell"));
         assert!(tool_names.iter().any(|n| n == "apply_patch"));
+    }
+
+    #[test]
+    fn parse_ts_epoch_handles_legacy_and_iso_forms() {
+        assert_eq!(parse_ts_epoch("1776361213Z"), Some(1_776_361_213));
+        assert_eq!(parse_ts_epoch("1776361213"), Some(1_776_361_213));
+        // Millisecond epoch auto-detected.
+        assert_eq!(parse_ts_epoch("1776361213000Z"), Some(1_776_361_213));
+        assert_eq!(
+            parse_ts_epoch("2026-04-16T00:00:00Z"),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-04-16T00:00:00Z")
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+        assert_eq!(
+            parse_ts_epoch("2026-04-16"),
+            Some(
+                chrono::NaiveDate::parse_from_str("2026-04-16", "%Y-%m-%d")
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_utc()
+                    .timestamp()
+            )
+        );
+        assert_eq!(parse_ts_epoch(""), None);
+        assert_eq!(parse_ts_epoch("not-a-date"), None);
+    }
+
+    #[test]
+    fn parse_since_expr_accepts_natural_language() {
+        let (iso_today, _) = parse_since_expr("today").expect("today");
+        assert!(iso_today.ends_with("T00:00:00Z"));
+        let (iso_yday, ts_yday) = parse_since_expr("yesterday").expect("yesterday");
+        let (_, ts_today) = parse_since_expr("today").unwrap();
+        assert_eq!(ts_today - ts_yday, 86_400);
+        assert!(iso_yday.ends_with("T00:00:00Z"));
+
+        let (_, ts_7d) = parse_since_expr("7d").expect("7d");
+        let now_ts = chrono::Utc::now().timestamp();
+        assert!((now_ts - ts_7d - 7 * 86_400).abs() < 120);
+
+        let (_, ts_iso) = parse_since_expr("2026-04-16").expect("iso");
+        assert_eq!(ts_iso, 1_776_297_600);
+
+        parse_since_expr("sunday").expect("sunday");
+        parse_since_expr("bogus").expect_err("rejects garbage");
+    }
+
+    #[test]
+    fn session_ids_in_window_tolerates_malformed_started_at() {
+        let (_env, store) = setup_store();
+        // Session with proper ISO, in window.
+        store
+            .exec_script(
+                "INSERT INTO sessions(session_id, started_at, ended_at, project_root, branch, model_family) \
+                 VALUES ('sess-iso', '2026-04-18T00:00:00Z', '2026-04-18T01:00:00Z', '/tmp/a', 'main', '');",
+            )
+            .unwrap();
+        // Session with legacy epoch-Z started_at that LOOKS before 2026-04-16
+        // lexicographically ('1' < '2') but whose epoch ~= 2026-04-17.
+        let epoch_2026_04_17 = 1_776_729_600_i64;
+        store
+            .exec_script(&format!(
+                "INSERT INTO sessions(session_id, started_at, ended_at, project_root, branch, model_family) \
+                 VALUES ('sess-legacy', '{}Z', '{}Z', '/tmp/b', 'main', '');",
+                epoch_2026_04_17, epoch_2026_04_17 + 3600
+            ))
+            .unwrap();
+        // Session entirely before the window.
+        store
+            .exec_script(
+                "INSERT INTO sessions(session_id, started_at, ended_at, project_root, branch, model_family) \
+                 VALUES ('sess-old', '2025-01-01T00:00:00Z', '2025-01-01T01:00:00Z', '/tmp/c', 'main', '');",
+            )
+            .unwrap();
+
+        let since_epoch = parse_ts_epoch("2026-04-16T00:00:00Z").unwrap();
+        let mut ids = session_ids_in_window(&store, None, None, since_epoch).unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["sess-iso".to_string(), "sess-legacy".to_string()]);
+    }
+
+    #[test]
+    fn rollup_since_does_not_silently_zero_on_legacy_timestamps() {
+        // Regression for sherlock-ed0: with legacy epoch-Z started_at values,
+        // `rollup --since 2026-04-16` used to return 0 despite populated data.
+        let (_env, store) = setup_store();
+        ingest_fixture(
+            &store,
+            "short_clean.jsonl",
+            "short-clean",
+            Path::new("/tmp/legacy-repo"),
+        );
+        // Rewrite started_at to the legacy epoch-Z form to simulate data from
+        // before the iso_now() fix. Use a recent epoch so the window includes it.
+        let epoch_now = chrono::Utc::now().timestamp();
+        store
+            .exec_script(&format!(
+                "UPDATE sessions SET started_at='{}Z', ended_at='{}Z' WHERE session_id='short-clean';",
+                epoch_now - 3600,
+                epoch_now
+            ))
+            .unwrap();
+
+        let report =
+            rollup_report(&store, "plugin", Some("1d"), Some("claude-code"), 20).unwrap();
+        let total_sessions = get_i64(&report, "total_sessions");
+        assert!(
+            total_sessions >= 1,
+            "expected rollup to include legacy-timestamp session; got total_sessions={total_sessions}, report={report}"
+        );
+        let grand = get_i64(&report, "grand_total_tokens");
+        assert!(
+            grand > 0,
+            "expected non-zero grand_total_tokens, got {grand}"
+        );
     }
 }
