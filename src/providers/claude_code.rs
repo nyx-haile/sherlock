@@ -197,6 +197,33 @@ impl Provider for ClaudeCodeProvider {
         None
     }
 
+    fn extract_subagent_type(&self, ev: &RawEvent) -> Option<String> {
+        let obj = ev.as_json()?;
+        let content = obj
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)?;
+        for item in content {
+            if item.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+            if name != "Agent" && name != "Task" {
+                continue;
+            }
+            if let Some(t) = item
+                .get("input")
+                .and_then(|v| v.get("subagent_type"))
+                .and_then(Value::as_str)
+            {
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
+            }
+        }
+        None
+    }
+
     fn extract_hook_name(&self, ev: &RawEvent) -> String {
         let Some(obj) = ev.as_json() else {
             return String::new();

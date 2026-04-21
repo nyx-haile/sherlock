@@ -50,6 +50,9 @@ pub trait Provider: Send + Sync {
     fn extract_plugin_id(&self, ev: &RawEvent, tool: &str) -> Option<String>;
     fn extract_mcp_server_name(&self, tool: &str) -> Option<String>;
     fn extract_hook_name(&self, ev: &RawEvent) -> String;
+    fn extract_subagent_type(&self, _ev: &RawEvent) -> Option<String> {
+        None
+    }
     fn infer_event_type(&self, ev: &RawEvent) -> String;
     fn extract_prompt_text(&self, ev: &RawEvent) -> Option<String>;
     fn event_time_value(&self, ev: &RawEvent) -> Option<String>;

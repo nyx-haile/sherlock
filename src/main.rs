@@ -145,6 +145,7 @@ CREATE INDEX IF NOT EXISTS idx_session_aliases_session ON session_aliases(sessio
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("sessions", "provider", "VARCHAR(32) NOT NULL DEFAULT 'claude-code'"),
     ("events", "provider", "VARCHAR(32) NOT NULL DEFAULT 'claude-code'"),
+    ("sources", "subagent_type", "VARCHAR(64)"),
 ];
 
 #[derive(Parser)]
@@ -369,6 +370,8 @@ struct SourceFact {
     plugin_id: String,
     tool_name: String,
     hook_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    subagent_type: String,
     event_count: i64,
     estimated_tokens: i64,
     estimated_pct: f64,
@@ -887,6 +890,51 @@ impl SherlockStore {
     }
 }
 
+struct IngestFile {
+    path: PathBuf,
+    raw: String,
+    artifact_id: String,
+    subagent_type: Option<String>,
+}
+
+/// Subagent transcripts live at `<main_stem>/subagents/agent-<id>.jsonl` with
+/// a sibling `.meta.json` giving {agentType, description}. Claude Code writes
+/// these alongside the main session JSONL; they share the same sessionId.
+fn discover_subagent_files(main_history: &Path) -> Vec<(PathBuf, Option<String>)> {
+    let parent = match main_history.parent() {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let stem = match main_history.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let sub_dir = parent.join(stem).join("subagents");
+    let entries = match fs::read_dir(&sub_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let meta_path = path.with_extension("meta.json");
+        let subagent_type = fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|v| {
+                v.get("agentType")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string())
+            });
+        out.push((path, subagent_type));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 fn ingest_session(
     store: &SherlockStore,
     provider: &dyn Provider,
@@ -897,8 +945,25 @@ fn ingest_session(
     model_family: &str,
 ) -> Result<IngestSummary> {
     let started_at = iso_now();
-    let raw = fs::read_to_string(history_path).unwrap_or_default();
-    let artifact_id = short_id("artifact");
+    let main_raw = fs::read_to_string(history_path).unwrap_or_default();
+    let main_artifact_id = short_id("artifact");
+
+    let mut files: Vec<IngestFile> = vec![IngestFile {
+        path: history_path.to_path_buf(),
+        raw: main_raw,
+        artifact_id: main_artifact_id,
+        subagent_type: None,
+    }];
+    for (path, subagent_type) in discover_subagent_files(history_path) {
+        let raw = fs::read_to_string(&path).unwrap_or_default();
+        files.push(IngestFile {
+            path,
+            raw,
+            artifact_id: short_id("artifact"),
+            subagent_type,
+        });
+    }
+
     let mut sql_script = String::new();
     sql_script.push_str("START TRANSACTION;\n");
     sql_script.push_str(&format!(
@@ -933,15 +998,17 @@ fn ingest_session(
         "DELETE FROM artifacts WHERE session_id='{}' AND artifact_type='history_jsonl';\n",
         sql(session_id)
     ));
-    sql_script.push_str(&format!(
-        "INSERT INTO artifacts(artifact_id, session_id, artifact_type, path_or_key, sha256, captured_at) \
-         VALUES ('{}','{}','history_jsonl','{}','{}','{}');\n",
-        artifact_id,
-        sql(session_id),
-        sql(&history_path.display().to_string()),
-        sha256_hex(&raw),
-        iso_now()
-    ));
+    for file in &files {
+        sql_script.push_str(&format!(
+            "INSERT INTO artifacts(artifact_id, session_id, artifact_type, path_or_key, sha256, captured_at) \
+             VALUES ('{}','{}','history_jsonl','{}','{}','{}');\n",
+            file.artifact_id,
+            sql(session_id),
+            sql(&file.path.display().to_string()),
+            sha256_hex(&file.raw),
+            iso_now()
+        ));
+    }
 
     let mut events = 0usize;
     let mut turns = 0usize;
@@ -955,113 +1022,124 @@ fn ingest_session(
     let mut first_event_time: Option<String> = None;
     let mut last_event_time: Option<String> = None;
 
-    for (idx, line) in raw.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let obj: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let ev = RawEvent::Json(obj.clone());
-        // An event belongs to the ingestion target if it explicitly names that
-        // session, or if the provider doesn't tag every event (None) — copilot
-        // CLI, for example, only stamps session.start with a sessionId.
-        match provider.extract_session_id(&ev) {
-            Some(id) if id != session_id => continue,
-            _ => {}
-        }
-
-        let event_time = provider
-            .event_time_value(&ev)
-            .unwrap_or_else(|| started_at.clone());
-        if first_event_time.is_none() {
-            first_event_time = Some(event_time.clone());
-        }
-        last_event_time = Some(event_time.clone());
-        let event_type = provider.infer_event_type(&ev);
-        let tool_name = provider.extract_tool_name(&ev);
-        let hook_name = provider.extract_hook_name(&ev);
-        let plugin_id = provider.extract_plugin_id(&ev, &tool_name);
-        let mcp_server_name = provider.extract_mcp_server_name(&tool_name);
-        let plugin_part = plugin_id.clone().unwrap_or_default();
-        let mcp_part = mcp_server_name.clone().unwrap_or_default();
-        let fp = format!(
-            "{event_type}|tool={tool_name}|hook={hook_name}|plugin={plugin_part}|mcp={mcp_part}"
-        );
-        let source_id = format!("source-{}", sha1_short(&fp));
-        if !seen_sources.contains(&fp) {
-            sql_script.push_str(&format!(
-                "INSERT INTO sources(source_id, source_kind, plugin_id, hook_name, mcp_server_name, tool_name, fingerprint) \
-                 VALUES ('{}','{}',{},'{}',{},'{}','{}') \
-                 ON DUPLICATE KEY UPDATE source_kind=VALUES(source_kind), plugin_id=VALUES(plugin_id), hook_name=VALUES(hook_name), mcp_server_name=VALUES(mcp_server_name), tool_name=VALUES(tool_name);\n",
-                source_id,
-                source_kind(&event_type),
-                sql_opt(&plugin_id),
-                sql(&hook_name),
-                sql_opt(&mcp_server_name),
-                sql(&tool_name),
-                sql(&fp)
-            ));
-            seen_sources.insert(fp);
-        }
-
-        let turn_id = short_id("turn");
-        let usage = provider.extract_usage(&ev);
-        cum_input += usage.input_tokens.unwrap_or(0);
-        cum_output += usage.output_tokens.unwrap_or(0);
-        cum_cache_read += usage.cache_read_tokens.unwrap_or(0);
-        cum_cache_write += usage.cache_write_tokens.unwrap_or(0);
-        let payload_bytes = serde_json::to_string(&obj).map(|s| s.len()).unwrap_or(0);
-
-        sql_script.push_str(&format!(
-            "INSERT INTO turns(turn_id, session_id, turn_index, started_at, ended_at, input_tokens_cum, output_tokens_cum, cache_read_tokens_cum, cache_write_tokens_cum, cost_cum_usd) \
-             VALUES ('{}','{}',{},'{}','{}',{},{},{},{},NULL);\n",
-            turn_id,
-            sql(session_id),
-            turns,
-            sql(&event_time),
-            sql(&event_time),
-            cum_input,
-            cum_output,
-            cum_cache_read,
-            cum_cache_write,
-        ));
-        turns += 1;
-
-        sql_script.push_str(&format!(
-            "INSERT INTO events(event_id, session_id, turn_id, event_time, event_type, source_id, payload_bytes, raw_ref, provider) \
-             VALUES ('{}','{}','{}','{}','{}','{}',{},'{}:{}','{}');\n",
-            short_id("event"),
-            sql(session_id),
-            turn_id,
-            sql(&event_time),
-            event_type,
-            source_id,
-            payload_bytes,
-            artifact_id,
-            idx + 1,
-            sql(provider.id())
-        ));
-        events += 1;
-
-        let total = cum_input + cum_output + cum_cache_read + cum_cache_write;
-        if let Some(prev) = prev_total {
-            let delta = total - prev;
-            if delta >= provider.spike_threshold() {
-                windows += 1;
-                sql_script.push_str(&format!(
-                    "INSERT INTO windows(window_id, session_id, start_time, end_time, reason, delta_tokens, delta_cost_usd) \
-                     VALUES ('{}','{}','{}','{}','spike',{},NULL);\n",
-                    short_id("window"),
-                    sql(session_id),
-                    sql(&event_time),
-                    sql(&event_time),
-                    delta
-                ));
+    for file in &files {
+        for (idx, line) in file.raw.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
             }
+            let obj: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let ev = RawEvent::Json(obj.clone());
+            // An event belongs to the ingestion target if it explicitly names that
+            // session, or if the provider doesn't tag every event (None) — copilot
+            // CLI, for example, only stamps session.start with a sessionId.
+            match provider.extract_session_id(&ev) {
+                Some(id) if id != session_id => continue,
+                _ => {}
+            }
+
+            let event_time = provider
+                .event_time_value(&ev)
+                .unwrap_or_else(|| started_at.clone());
+            if first_event_time.is_none() {
+                first_event_time = Some(event_time.clone());
+            }
+            last_event_time = Some(event_time.clone());
+            let event_type = provider.infer_event_type(&ev);
+            let tool_name = provider.extract_tool_name(&ev);
+            let hook_name = provider.extract_hook_name(&ev);
+            let plugin_id = provider.extract_plugin_id(&ev, &tool_name);
+            let mcp_server_name = provider.extract_mcp_server_name(&tool_name);
+            // Sidechain events inherit the subagent_type of the file they came
+            // from; main-session events can self-tag via an Agent/Task tool_use
+            // whose input names the subagent type.
+            let subagent_type = file
+                .subagent_type
+                .clone()
+                .or_else(|| provider.extract_subagent_type(&ev))
+                .unwrap_or_default();
+            let plugin_part = plugin_id.clone().unwrap_or_default();
+            let mcp_part = mcp_server_name.clone().unwrap_or_default();
+            let fp = format!(
+                "{event_type}|tool={tool_name}|hook={hook_name}|plugin={plugin_part}|mcp={mcp_part}|subagent={subagent_type}"
+            );
+            let source_id = format!("source-{}", sha1_short(&fp));
+            if !seen_sources.contains(&fp) {
+                sql_script.push_str(&format!(
+                    "INSERT INTO sources(source_id, source_kind, plugin_id, hook_name, mcp_server_name, tool_name, subagent_type, fingerprint) \
+                     VALUES ('{}','{}',{},'{}',{},'{}',{},'{}') \
+                     ON DUPLICATE KEY UPDATE source_kind=VALUES(source_kind), plugin_id=VALUES(plugin_id), hook_name=VALUES(hook_name), mcp_server_name=VALUES(mcp_server_name), tool_name=VALUES(tool_name), subagent_type=VALUES(subagent_type);\n",
+                    source_id,
+                    source_kind(&event_type),
+                    sql_opt(&plugin_id),
+                    sql(&hook_name),
+                    sql_opt(&mcp_server_name),
+                    sql(&tool_name),
+                    if subagent_type.is_empty() { "NULL".to_string() } else { format!("'{}'", sql(&subagent_type)) },
+                    sql(&fp)
+                ));
+                seen_sources.insert(fp);
+            }
+
+            let turn_id = short_id("turn");
+            let usage = provider.extract_usage(&ev);
+            cum_input += usage.input_tokens.unwrap_or(0);
+            cum_output += usage.output_tokens.unwrap_or(0);
+            cum_cache_read += usage.cache_read_tokens.unwrap_or(0);
+            cum_cache_write += usage.cache_write_tokens.unwrap_or(0);
+            let payload_bytes = serde_json::to_string(&obj).map(|s| s.len()).unwrap_or(0);
+
+            sql_script.push_str(&format!(
+                "INSERT INTO turns(turn_id, session_id, turn_index, started_at, ended_at, input_tokens_cum, output_tokens_cum, cache_read_tokens_cum, cache_write_tokens_cum, cost_cum_usd) \
+                 VALUES ('{}','{}',{},'{}','{}',{},{},{},{},NULL);\n",
+                turn_id,
+                sql(session_id),
+                turns,
+                sql(&event_time),
+                sql(&event_time),
+                cum_input,
+                cum_output,
+                cum_cache_read,
+                cum_cache_write,
+            ));
+            turns += 1;
+
+            sql_script.push_str(&format!(
+                "INSERT INTO events(event_id, session_id, turn_id, event_time, event_type, source_id, payload_bytes, raw_ref, provider) \
+                 VALUES ('{}','{}','{}','{}','{}','{}',{},'{}:{}','{}');\n",
+                short_id("event"),
+                sql(session_id),
+                turn_id,
+                sql(&event_time),
+                event_type,
+                source_id,
+                payload_bytes,
+                file.artifact_id,
+                idx + 1,
+                sql(provider.id())
+            ));
+            events += 1;
+
+            let total = cum_input + cum_output + cum_cache_read + cum_cache_write;
+            if let Some(prev) = prev_total {
+                let delta = total - prev;
+                if delta >= provider.spike_threshold() {
+                    windows += 1;
+                    sql_script.push_str(&format!(
+                        "INSERT INTO windows(window_id, session_id, start_time, end_time, reason, delta_tokens, delta_cost_usd) \
+                         VALUES ('{}','{}','{}','{}','spike',{},NULL);\n",
+                        short_id("window"),
+                        sql(session_id),
+                        sql(&event_time),
+                        sql(&event_time),
+                        delta
+                    ));
+                }
+            }
+            prev_total = Some(total);
         }
-        prev_total = Some(total);
     }
 
     sql_script.push_str(&format!(
@@ -1108,10 +1186,10 @@ fn summarize_session(store: &SherlockStore, session_id: &str) -> Result<Value> {
     let prompt_stats = prompt_facts(store, &*provider, session_id)?;
     let grand_total = totals.total_tokens;
     let top_source_rows = store.query_rows(&format!(
-        "SELECT e.source_id, s.source_kind, COALESCE(s.plugin_id, '') AS plugin_id, COALESCE(s.tool_name, '') AS tool_name, COALESCE(s.hook_name, '') AS hook_name, COUNT(*) AS event_count \
+        "SELECT e.source_id, s.source_kind, COALESCE(s.plugin_id, '') AS plugin_id, COALESCE(s.tool_name, '') AS tool_name, COALESCE(s.hook_name, '') AS hook_name, COALESCE(s.subagent_type, '') AS subagent_type, COUNT(*) AS event_count \
          FROM events e JOIN sources s ON e.source_id = s.source_id \
          WHERE e.session_id='{}' \
-         GROUP BY e.source_id, s.source_kind, s.plugin_id, s.tool_name, s.hook_name \
+         GROUP BY e.source_id, s.source_kind, s.plugin_id, s.tool_name, s.hook_name, s.subagent_type \
          ORDER BY event_count DESC LIMIT 50",
         sql(session_id)
     ))?;
@@ -1132,6 +1210,7 @@ fn summarize_session(store: &SherlockStore, session_id: &str) -> Result<Value> {
                 plugin_id: get_str(src, "plugin_id"),
                 tool_name: get_str(src, "tool_name"),
                 hook_name: get_str(src, "hook_name"),
+                subagent_type: get_str(src, "subagent_type"),
                 event_count: get_i64(src, "event_count"),
                 estimated_tokens,
                 estimated_pct,
@@ -1832,6 +1911,7 @@ fn render_report_markdown(report: &Value) -> Result<String> {
     if !top_sources.is_empty() {
         writeln!(&mut out, "\n## Top Sources")?;
         for source in top_sources {
+            let subagent = get_str(&source, "subagent_type");
             let label = if !get_str(&source, "tool_name").is_empty() {
                 get_str(&source, "tool_name")
             } else if !get_str(&source, "hook_name").is_empty() {
@@ -1839,10 +1919,15 @@ fn render_report_markdown(report: &Value) -> Result<String> {
             } else {
                 get_str(&source, "source_kind")
             };
+            let display_label = if subagent.is_empty() {
+                label
+            } else {
+                format!("{subagent}:{label}")
+            };
             writeln!(
                 &mut out,
                 "- `{}`: {} estimated tokens ({:.1}%), {} events{}",
-                label,
+                display_label,
                 get_i64(&source, "estimated_tokens"),
                 get_f64(&source, "estimated_pct"),
                 get_i64(&source, "event_count"),
@@ -2559,10 +2644,10 @@ fn run_tui(store: &SherlockStore, session_id: &str) -> Result<()> {
     ))?;
     let totals = totals_rows.first().cloned().unwrap_or_else(|| json!({}));
     let top_sources = store.query_rows(&format!(
-        "SELECT e.source_id, s.source_kind, COALESCE(s.plugin_id, '') AS plugin_id, COALESCE(s.tool_name, '') AS tool_name, COALESCE(s.hook_name, '') AS hook_name, COUNT(*) AS event_count \
+        "SELECT e.source_id, s.source_kind, COALESCE(s.plugin_id, '') AS plugin_id, COALESCE(s.tool_name, '') AS tool_name, COALESCE(s.hook_name, '') AS hook_name, COALESCE(s.subagent_type, '') AS subagent_type, COUNT(*) AS event_count \
          FROM events e JOIN sources s ON e.source_id=s.source_id \
          WHERE e.session_id='{}' \
-         GROUP BY e.source_id, s.source_kind, s.plugin_id, s.tool_name, s.hook_name \
+         GROUP BY e.source_id, s.source_kind, s.plugin_id, s.tool_name, s.hook_name, s.subagent_type \
          ORDER BY event_count DESC LIMIT 8",
         sql(session_id)
     ))?;
@@ -3218,11 +3303,19 @@ fn headline_report(
         global_cache_read += cache_read;
         global_cache_write += cache_write;
 
+        // Prefer subagent_type over the 'core' source_kind catch-all so headline
+        // top-sources surfaces meaningful work (Explore, Plan, plugin agents)
+        // instead of the bare assistant-turn bucket. Fully-bare core rows
+        // (no tool/plugin/subagent) are excluded from this ranking.
         let source_rows = store.query_rows(&format!(
-            "SELECT COALESCE(NULLIF(s.plugin_id,''), NULLIF(s.tool_name,''), s.source_kind) AS group_key, \
+            "SELECT COALESCE(NULLIF(s.subagent_type,''), NULLIF(s.plugin_id,''), NULLIF(s.tool_name,''), s.source_kind) AS group_key, \
              COUNT(*) AS event_count \
              FROM events e JOIN sources s ON e.source_id = s.source_id \
              WHERE e.session_id IN ({in_list}) \
+             AND NOT (s.source_kind='core' \
+                      AND COALESCE(s.subagent_type,'')='' \
+                      AND COALESCE(s.plugin_id,'')='' \
+                      AND COALESCE(s.tool_name,'')='') \
              GROUP BY group_key ORDER BY event_count DESC LIMIT {top}"
         ))?;
         let top_sources: Vec<Value> = source_rows
@@ -3793,6 +3886,72 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(finding_ids.contains(&"oversized-continuation-summary".to_string()));
         assert!(finding_ids.contains(&"low-prompt-count-high-usage".to_string()));
+    }
+
+    #[test]
+    fn subagent_fixture_tags_sources_with_subagent_type() {
+        let (_temp, store) = setup_store();
+        let project_root = PathBuf::from("/tmp/project-sub");
+        ingest_fixture(&store, "subagent_basic.jsonl", "subagent-basic", &project_root);
+        let report = summarize_session(&store, "subagent-basic").expect("summarize");
+        let top_sources = report
+            .get("top_sources")
+            .and_then(Value::as_array)
+            .expect("top_sources array")
+            .clone();
+        let subagent_tags: Vec<String> = top_sources
+            .iter()
+            .map(|s| get_str(s, "subagent_type"))
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(
+            subagent_tags.iter().any(|t| t == "Explore"),
+            "expected at least one source tagged subagent_type=Explore, got {:?}",
+            subagent_tags
+        );
+
+        // The Agent tool_use in the main session should carry subagent_type
+        // from its input, and Grep from inside the sidechain should inherit
+        // Explore from the subagent meta.
+        let has_agent_explore = top_sources.iter().any(|s| {
+            get_str(s, "tool_name") == "Agent" && get_str(s, "subagent_type") == "Explore"
+        });
+        let has_grep_explore = top_sources.iter().any(|s| {
+            get_str(s, "tool_name") == "Grep" && get_str(s, "subagent_type") == "Explore"
+        });
+        assert!(has_agent_explore, "missing Agent tool_use tagged Explore");
+        assert!(has_grep_explore, "missing Grep sidechain tagged Explore");
+    }
+
+    #[test]
+    fn headline_group_key_prefers_subagent_type_over_core() {
+        let (_temp, store) = setup_store();
+        let project_root = PathBuf::from("/tmp/project-sub");
+        ingest_fixture(&store, "subagent_basic.jsonl", "subagent-basic", &project_root);
+        let rows = store
+            .query_rows(
+                "SELECT COALESCE(NULLIF(s.subagent_type,''), NULLIF(s.plugin_id,''), NULLIF(s.tool_name,''), s.source_kind) AS group_key, \
+                 COUNT(*) AS event_count \
+                 FROM events e JOIN sources s ON e.source_id = s.source_id \
+                 WHERE e.session_id='subagent-basic' \
+                 AND NOT (s.source_kind='core' \
+                          AND COALESCE(s.subagent_type,'')='' \
+                          AND COALESCE(s.plugin_id,'')='' \
+                          AND COALESCE(s.tool_name,'')='') \
+                 GROUP BY group_key ORDER BY event_count DESC",
+            )
+            .expect("query headline group_key");
+        let keys: Vec<String> = rows.iter().map(|r| get_str(r, "group_key")).collect();
+        assert!(
+            keys.iter().any(|k| k == "Explore"),
+            "headline group_key should surface 'Explore' (subagent_type), got {:?}",
+            keys
+        );
+        assert!(
+            !keys.iter().any(|k| k == "core"),
+            "headline ranking should exclude bare 'core' source_kind, got {:?}",
+            keys
+        );
     }
 
     #[test]
