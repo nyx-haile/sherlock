@@ -28,6 +28,7 @@ Run `sherlock ingest --provider <id>` to force a specific adapter, or omit it fo
 - Complete your Sherlock operations quickly, or
 - Temporarily stop Dolt servers while using Sherlock
 - This interference is temporary and only occurs while Sherlock is actively running commands
+- Pass `--ignore` to suppress the warning (e.g. `sherlock --ignore report` or `sherlock report --ignore`) — it is a global flag, so it is accepted before or after the subcommand. It only silences the message; it does not change how Sherlock invokes Dolt.
 
 ## Repository Scope
 

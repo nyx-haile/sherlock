@@ -154,6 +154,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
 struct Cli {
     #[arg(long, default_value_os_t = default_repo())]
     repo: PathBuf,
+    /// Suppress the warning about running `dolt sql-server` processes.
+    #[arg(long, global = true, default_value_t = false)]
+    ignore: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -500,8 +503,10 @@ struct PromptRecord {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     
-    // Warn about running dolt servers that could be affected
-    check_for_dolt_servers();
+    // Warn about running dolt servers that could be affected, unless --ignore.
+    if !cli.ignore {
+        check_for_dolt_servers();
+    }
     
     fs::create_dir_all(&cli.repo)?;
     let store = SherlockStore::new(cli.repo);
@@ -4171,5 +4176,24 @@ mod tests {
             grand > 0,
             "expected non-zero grand_total_tokens, got {grand}"
         );
+    }
+
+    #[test]
+    fn ignore_flag_parses_before_subcommand() {
+        let cli = Cli::try_parse_from(["sherlock", "--ignore", "init"]).expect("parse --ignore");
+        assert!(cli.ignore);
+    }
+
+    #[test]
+    fn ignore_flag_defaults_to_false() {
+        let cli = Cli::try_parse_from(["sherlock", "init"]).expect("parse without --ignore");
+        assert!(!cli.ignore);
+    }
+
+    #[test]
+    fn ignore_flag_parses_after_subcommand() {
+        let cli =
+            Cli::try_parse_from(["sherlock", "init", "--ignore"]).expect("parse trailing --ignore");
+        assert!(cli.ignore);
     }
 }
