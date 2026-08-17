@@ -68,6 +68,17 @@ pub trait Provider: Send + Sync {
     fn has_cache_tokens(&self) -> bool {
         true
     }
+    /// Whether this provider's transcripts carry extended-thinking blocks at
+    /// all. Gates the thinking-duration report section so providers that never
+    /// emit them do not grow an always-empty section.
+    fn has_thinking(&self) -> bool {
+        false
+    }
+    /// Whether *this* event carries a thinking block. Only meaningful when
+    /// [`Provider::has_thinking`] is true.
+    fn event_has_thinking(&self, _ev: &RawEvent) -> bool {
+        false
+    }
     fn has_continuation_summaries(&self) -> bool {
         true
     }

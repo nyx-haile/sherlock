@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS turns (
     output_tokens_cum INTEGER,
     cache_read_tokens_cum INTEGER,
     cache_write_tokens_cum INTEGER,
-    cost_cum_usd REAL
+    cost_cum_usd REAL,
+    thinking_ms INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS sources (
@@ -146,6 +147,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("sessions", "provider", "VARCHAR(32) NOT NULL DEFAULT 'claude-code'"),
     ("events", "provider", "VARCHAR(32) NOT NULL DEFAULT 'claude-code'"),
     ("sources", "subagent_type", "VARCHAR(64)"),
+    ("turns", "thinking_ms", "INTEGER"),
 ];
 
 #[derive(Parser)]
@@ -442,6 +444,29 @@ struct ComparisonFacts {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+struct SlowThinkingTurn {
+    turn_index: i64,
+    started_at: String,
+    thinking_ms: i64,
+}
+
+/// Per-session aggregate of the per-turn thinking-block durations recorded at
+/// ingest time (`turns.thinking_ms`).
+///
+/// `supported` distinguishes "this provider never emits thinking blocks" from
+/// "it does, but this session had none" — otherwise an all-zero section reads
+/// like a bug.
+#[derive(Clone, Debug, Default, Serialize)]
+struct ThinkingFacts {
+    supported: bool,
+    turns_with_thinking: usize,
+    total_thinking_ms: i64,
+    p50_ms: i64,
+    p95_ms: i64,
+    slowest_turns: Vec<SlowThinkingTurn>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 struct Finding {
     id: String,
     severity: String,
@@ -477,6 +502,7 @@ struct SessionReport {
     sources_without_tokens: Vec<SourceFact>,
     spikes: Vec<SpikeFact>,
     comparisons: ComparisonFacts,
+    thinking: ThinkingFacts,
     findings: Vec<Finding>,
     recommendations: Vec<Recommendation>,
     insights: Vec<String>,
@@ -1028,6 +1054,10 @@ fn ingest_session(
     let mut last_event_time: Option<String> = None;
 
     for file in &files {
+        // Thinking duration is measured against the previous event *in the same
+        // transcript file*; subagent files are separate timelines, so the
+        // cursor resets per file rather than running across the whole session.
+        let mut prev_event_ms: Option<i64> = None;
         for (idx, line) in file.raw.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
@@ -1088,6 +1118,25 @@ fn ingest_session(
                 seen_sources.insert(fp);
             }
 
+            // Approximate per-turn thinking time: wall clock from the previous
+            // transcript event (the request that kicked this turn off) to the
+            // assistant message that carries the thinking block. Recorded only
+            // for events that actually contain one, so turns without extended
+            // thinking stay NULL rather than reading as "thought for 0ms".
+            let event_ms = parse_ts_epoch_ms(&event_time);
+            let thinking_ms: Option<i64> =
+                if provider.has_thinking() && provider.event_has_thinking(&ev) {
+                    match (prev_event_ms, event_ms) {
+                        (Some(prev), Some(cur)) if cur >= prev => Some(cur - prev),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+            if event_ms.is_some() {
+                prev_event_ms = event_ms;
+            }
+
             let turn_id = short_id("turn");
             let usage = provider.extract_usage(&ev);
             cum_input += usage.input_tokens.unwrap_or(0);
@@ -1097,8 +1146,8 @@ fn ingest_session(
             let payload_bytes = serde_json::to_string(&obj).map(|s| s.len()).unwrap_or(0);
 
             sql_script.push_str(&format!(
-                "INSERT INTO turns(turn_id, session_id, turn_index, started_at, ended_at, input_tokens_cum, output_tokens_cum, cache_read_tokens_cum, cache_write_tokens_cum, cost_cum_usd) \
-                 VALUES ('{}','{}',{},'{}','{}',{},{},{},{},NULL);\n",
+                "INSERT INTO turns(turn_id, session_id, turn_index, started_at, ended_at, input_tokens_cum, output_tokens_cum, cache_read_tokens_cum, cache_write_tokens_cum, cost_cum_usd, thinking_ms) \
+                 VALUES ('{}','{}',{},'{}','{}',{},{},{},{},NULL,{});\n",
                 turn_id,
                 sql(session_id),
                 turns,
@@ -1108,6 +1157,10 @@ fn ingest_session(
                 cum_output,
                 cum_cache_read,
                 cum_cache_write,
+                match thinking_ms {
+                    Some(ms) => ms.to_string(),
+                    None => "NULL".to_string(),
+                },
             ));
             turns += 1;
 
@@ -1252,6 +1305,7 @@ fn summarize_session(store: &SherlockStore, session_id: &str) -> Result<Value> {
         spikes: spikes.clone(),
         comparisons: comparisons.clone(),
     };
+    let thinking = thinking_facts(store, &*provider, session_id)?;
     let findings = findings_from_facts(&*provider, &facts);
     let recommendations = recommendations_from_findings(&findings);
     let insights = insights_from_facts(&facts, &findings);
@@ -1280,6 +1334,7 @@ fn summarize_session(store: &SherlockStore, session_id: &str) -> Result<Value> {
         sources_without_tokens,
         spikes,
         comparisons,
+        thinking,
         findings,
         recommendations,
         insights,
@@ -1312,6 +1367,57 @@ fn session_totals(store: &SherlockStore, session_id: &str) -> Result<SessionTota
         cache_read_pct: pct(cache_read_tokens, total_tokens),
         cache_write_pct: pct(cache_write_tokens, total_tokens),
     })
+}
+
+/// Aggregate `turns.thinking_ms` for one session into p50/p95/slowest.
+///
+/// Rows with a NULL `thinking_ms` (turns with no thinking block, or ones whose
+/// timestamps could not be parsed) are excluded rather than counted as zero —
+/// otherwise the percentiles collapse toward 0 on tool-heavy sessions.
+fn thinking_facts(
+    store: &SherlockStore,
+    provider: &dyn Provider,
+    session_id: &str,
+) -> Result<ThinkingFacts> {
+    if !provider.has_thinking() {
+        return Ok(ThinkingFacts::default());
+    }
+    let rows = store.query_rows(&format!(
+        "SELECT turn_index, COALESCE(started_at,'') AS started_at, thinking_ms \
+         FROM turns WHERE session_id='{}' AND thinking_ms IS NOT NULL \
+         ORDER BY thinking_ms DESC",
+        sql(session_id)
+    ))?;
+    let mut durations: Vec<i64> = rows.iter().map(|row| get_i64(row, "thinking_ms")).collect();
+    let slowest_turns = rows
+        .iter()
+        .take(3)
+        .map(|row| SlowThinkingTurn {
+            turn_index: get_i64(row, "turn_index"),
+            started_at: get_str(row, "started_at"),
+            thinking_ms: get_i64(row, "thinking_ms"),
+        })
+        .collect::<Vec<_>>();
+    durations.sort_unstable();
+    Ok(ThinkingFacts {
+        supported: true,
+        turns_with_thinking: durations.len(),
+        total_thinking_ms: durations.iter().sum(),
+        p50_ms: percentile_ms(&durations, 50.0),
+        p95_ms: percentile_ms(&durations, 95.0),
+        slowest_turns,
+    })
+}
+
+/// Nearest-rank percentile over an ascending-sorted slice. Returns 0 for an
+/// empty slice, which callers gate on `turns_with_thinking` before showing.
+fn percentile_ms(sorted_ms: &[i64], p: f64) -> i64 {
+    if sorted_ms.is_empty() {
+        return 0;
+    }
+    let rank = ((p / 100.0) * sorted_ms.len() as f64).ceil() as usize;
+    let idx = rank.saturating_sub(1).min(sorted_ms.len() - 1);
+    sorted_ms[idx]
 }
 
 fn prompt_facts(
@@ -1945,6 +2051,35 @@ fn render_report_markdown(report: &Value) -> Result<String> {
         }
     }
 
+    let thinking = report.get("thinking").cloned().unwrap_or_else(|| json!({}));
+    if thinking.get("supported").and_then(Value::as_bool) == Some(true)
+        && get_i64(&thinking, "turns_with_thinking") > 0
+    {
+        writeln!(&mut out, "\n## Thinking Time")?;
+        writeln!(
+            &mut out,
+            "**{}** turn(s) carried a thinking block, totaling **{}**. p50 **{}**, p95 **{}**.",
+            get_i64(&thinking, "turns_with_thinking"),
+            fmt_ms(get_i64(&thinking, "total_thinking_ms")),
+            fmt_ms(get_i64(&thinking, "p50_ms")),
+            fmt_ms(get_i64(&thinking, "p95_ms")),
+        )?;
+        let slowest = thinking
+            .get("slowest_turns")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for turn in slowest {
+            writeln!(
+                &mut out,
+                "- turn {} at `{}`: {}",
+                get_i64(&turn, "turn_index"),
+                get_str(&turn, "started_at"),
+                fmt_ms(get_i64(&turn, "thinking_ms")),
+            )?;
+        }
+    }
+
     let spikes = report
         .get("spikes")
         .and_then(Value::as_array)
@@ -2015,6 +2150,28 @@ fn render_report_text(report: &Value) -> Result<String> {
         get_i64(&prompts, "total_prompt_chars"),
         get_f64(&prompts, "average_prompt_chars"),
     )?;
+
+    let thinking = report.get("thinking").cloned().unwrap_or_else(|| json!({}));
+    if thinking.get("supported").and_then(Value::as_bool) == Some(true)
+        && get_i64(&thinking, "turns_with_thinking") > 0
+    {
+        writeln!(
+            &mut out,
+            "Thinking: {} turn(s), {} total, p50 {}, p95 {}, slowest {}",
+            get_i64(&thinking, "turns_with_thinking"),
+            fmt_ms(get_i64(&thinking, "total_thinking_ms")),
+            fmt_ms(get_i64(&thinking, "p50_ms")),
+            fmt_ms(get_i64(&thinking, "p95_ms")),
+            fmt_ms(
+                thinking
+                    .get("slowest_turns")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.first())
+                    .map(|turn| get_i64(turn, "thinking_ms"))
+                    .unwrap_or(0)
+            ),
+        )?;
+    }
 
     let findings = report
         .get("findings")
@@ -2310,6 +2467,17 @@ fn rollup_report(
         "grand_total_tokens": grand_total,
         "entries": entries,
     }))
+}
+
+/// Human-readable duration for millisecond counts. Sub-second values keep the
+/// `ms` unit; anything longer reads in seconds, which is the scale people
+/// actually quote thinking time at ("thought for 42s").
+fn fmt_ms(ms: i64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
 }
 
 fn render_rollup_table(report: &Value, group_by: &str) -> Result<String> {
@@ -2918,6 +3086,40 @@ fn parse_ts_epoch(s: &str) -> Option<i64> {
         }
     }
     None
+}
+
+/// Parse a timestamp into epoch **milliseconds**, keeping the sub-second
+/// precision that [`parse_ts_epoch`] truncates away. Needed for per-turn
+/// thinking durations, which routinely land under a second.
+///
+/// Tolerates the same forms as `parse_ts_epoch`:
+/// - RFC3339 with or without fractional seconds ("2026-08-17T01:02:03.250Z")
+/// - Legacy Sherlock epoch-Z form ("1776361213Z")
+/// - Bare integer seconds or milliseconds (auto-detected by magnitude)
+fn parse_ts_epoch_ms(s: &str) -> Option<i64> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let stripped = trimmed.trim_end_matches('Z');
+    if let Ok(n) = stripped.parse::<i64>() {
+        // Same magnitude heuristic as parse_ts_epoch, inverted: anything at or
+        // below ~11 digits is seconds and needs scaling up to ms.
+        return Some(if n > 9_999_999_999 { n } else { n * 1000 });
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Some(dt.timestamp_millis());
+    }
+    for fmt in &[
+        "%Y-%m-%dT%H:%M:%S%.fZ",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(trimmed, fmt) {
+            return Some(ndt.and_utc().timestamp_millis());
+        }
+    }
+    parse_ts_epoch(trimmed).map(|secs| secs * 1000)
 }
 
 /// Parse a user-supplied `--since`/`--modified-since` expression into
@@ -3942,6 +4144,81 @@ mod tests {
         assert!(markdown.contains("Cache reads dominate session spend."));
         assert!(text.contains("Recommendations:"));
         assert!(text.contains("Reduce context rehydration between turns."));
+    }
+
+    #[test]
+    fn parse_ts_epoch_ms_keeps_subsecond_precision() {
+        assert_eq!(
+            parse_ts_epoch_ms("2026-08-17T09:00:02.500Z"),
+            Some(1_786_957_202_500)
+        );
+        assert_eq!(
+            parse_ts_epoch_ms("2026-08-17T09:00:02Z"),
+            Some(1_786_957_202_000)
+        );
+        // Legacy epoch-seconds and epoch-Z forms scale up to ms.
+        assert_eq!(parse_ts_epoch_ms("1786957202"), Some(1_786_957_202_000));
+        assert_eq!(parse_ts_epoch_ms("1786957202Z"), Some(1_786_957_202_000));
+        // Values already in ms pass through untouched.
+        assert_eq!(parse_ts_epoch_ms("1786957202500"), Some(1_786_957_202_500));
+        assert_eq!(parse_ts_epoch_ms(""), None);
+        assert_eq!(parse_ts_epoch_ms("not-a-timestamp"), None);
+    }
+
+    #[test]
+    fn percentile_ms_uses_nearest_rank() {
+        assert_eq!(percentile_ms(&[], 50.0), 0);
+        assert_eq!(percentile_ms(&[2500, 8000], 50.0), 2500);
+        assert_eq!(percentile_ms(&[2500, 8000], 95.0), 8000);
+        assert_eq!(percentile_ms(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 95.0), 10);
+        assert_eq!(percentile_ms(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 50.0), 5);
+    }
+
+    #[test]
+    fn thinking_fixture_records_per_turn_durations() {
+        let (_temp, store) = setup_store();
+        let project_root = PathBuf::from("/tmp/project-think");
+        ingest_fixture(
+            &store,
+            "thinking_blocks.jsonl",
+            "thinking-blocks",
+            &project_root,
+        );
+        let provider = providers::claude_code::ClaudeCodeProvider;
+        let facts = thinking_facts(&store, &provider, "thinking-blocks").expect("thinking facts");
+
+        // Two assistant turns carry a thinking block: 09:00:00.000 -> 09:00:02.500
+        // and 09:00:03.000 -> 09:00:11.000. The final text-only turn does not.
+        assert!(facts.supported);
+        assert_eq!(facts.turns_with_thinking, 2);
+        assert_eq!(facts.total_thinking_ms, 10_500);
+        assert_eq!(facts.p50_ms, 2_500);
+        assert_eq!(facts.p95_ms, 8_000);
+        assert_eq!(facts.slowest_turns[0].thinking_ms, 8_000);
+
+        let report = summarize_session(&store, "thinking-blocks").expect("summarize");
+        let markdown = render_report_markdown(&report).expect("markdown");
+        assert!(markdown.contains("## Thinking Time"));
+        assert!(
+            markdown.contains("p50 **2.5s**, p95 **8.0s**"),
+            "expected thinking percentiles in markdown, got:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn thinking_facts_are_empty_for_providers_without_thinking() {
+        let (_temp, store) = setup_store();
+        let project_root = PathBuf::from("/tmp/project-think");
+        ingest_fixture(
+            &store,
+            "thinking_blocks.jsonl",
+            "thinking-blocks",
+            &project_root,
+        );
+        let provider = providers::codex::CodexProvider;
+        let facts = thinking_facts(&store, &provider, "thinking-blocks").expect("thinking facts");
+        assert!(!facts.supported);
+        assert_eq!(facts.turns_with_thinking, 0);
     }
 
     #[test]

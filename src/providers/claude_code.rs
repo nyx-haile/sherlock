@@ -337,6 +337,30 @@ impl Provider for ClaudeCodeProvider {
             .unwrap_or(false)
     }
 
+    fn has_thinking(&self) -> bool {
+        true
+    }
+
+    /// Claude Code writes extended thinking as a `thinking` (or
+    /// `redacted_thinking`) content block on the assistant message.
+    fn event_has_thinking(&self, ev: &RawEvent) -> bool {
+        let Some(obj) = ev.as_json() else {
+            return false;
+        };
+        obj.get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items.iter().any(|item| {
+                    matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some("thinking") | Some("redacted_thinking")
+                    )
+                })
+            })
+            .unwrap_or(false)
+    }
+
     fn continuation_markers(&self) -> &'static [&'static str] {
         CONTINUATION_MARKERS
     }
