@@ -508,7 +508,7 @@ fn main() -> Result<()> {
         check_for_dolt_servers();
     }
     
-    fs::create_dir_all(&cli.repo)?;
+    ensure_repo_usable(&cli.repo)?;
     let store = SherlockStore::new(cli.repo);
     // Apply pending additive migrations on every invocation. Cheap — just an
     // information_schema probe when everything is already up to date — and
@@ -3657,9 +3657,83 @@ fn git_branch(cwd: &Path) -> Option<String> {
     }
 }
 
+/// Resolve the default data-repo location from the environment.
+///
+/// Pure so it can be tested without mutating process env:
+///   * a non-empty `SHERLOCK_REPO` wins (a leading `~/` is expanded against
+///     `home`), which lets users on read-only sandboxes point the dolt repo at
+///     a writable path without passing `--repo` on every call;
+///   * otherwise `<home>/.local/share/sherlock`;
+///   * when `home` is unset we keep the historical `.` fallback.
+///
+/// An explicit `--repo` still wins over both — clap only consults this for the
+/// default value.
+fn resolve_default_repo(env_repo: Option<String>, home: Option<String>) -> PathBuf {
+    let home_dir = home
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| ".".to_string());
+
+    if let Some(raw) = env_repo {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return match trimmed.strip_prefix("~/") {
+                Some(rest) => PathBuf::from(&home_dir).join(rest),
+                None => PathBuf::from(trimmed),
+            };
+        }
+    }
+
+    PathBuf::from(home_dir).join(".local/share/sherlock")
+}
+
 fn default_repo() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
-        .join(".local/share/sherlock")
+    resolve_default_repo(
+        std::env::var("SHERLOCK_REPO").ok(),
+        std::env::var("HOME").ok(),
+    )
+}
+
+/// Build the user-facing error for a repo path we cannot use, naming both escape hatches.
+fn repo_unusable_error(repo: &Path, err: &std::io::Error, verb: &str) -> anyhow::Error {
+    // EROFS is raw os error 30 on Linux; a read-only bind mount surfaces that
+    // rather than PermissionDenied.
+    let not_writable =
+        err.kind() == std::io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(30);
+
+    if not_writable {
+        anyhow!(
+            "cannot {verb} the sherlock data repo at {} ({err}).\n\
+             That location is not writable (read-only filesystem or sandbox). \
+             Point sherlock at a writable path with either:\n  \
+             sherlock --repo <path> ...\n  \
+             export SHERLOCK_REPO=<path>",
+            repo.display()
+        )
+    } else {
+        anyhow!(
+            "cannot {verb} the sherlock data repo at {}: {err}",
+            repo.display()
+        )
+    }
+}
+
+/// Create the data repo and prove it is actually writable.
+///
+/// `create_dir_all` returns `Ok` for a directory that already exists even when
+/// the filesystem is mounted read-only, so a bare create is not enough to catch
+/// a sandboxed `$HOME`. Probe with a real sentinel write and fail early with an
+/// actionable message instead of letting dolt blow up later.
+fn ensure_repo_usable(repo: &Path) -> Result<()> {
+    fs::create_dir_all(repo).map_err(|e| repo_unusable_error(repo, &e, "create"))?;
+
+    let sentinel = repo.join(".sherlock-write-probe");
+    match fs::write(&sentinel, b"") {
+        Ok(()) => {
+            let _ = fs::remove_file(&sentinel);
+            Ok(())
+        }
+        Err(e) => Err(repo_unusable_error(repo, &e, "write to")),
+    }
 }
 
 fn check_for_dolt_servers() {
@@ -4195,5 +4269,104 @@ mod tests {
         let cli =
             Cli::try_parse_from(["sherlock", "init", "--ignore"]).expect("parse trailing --ignore");
         assert!(cli.ignore);
+    }
+
+    #[test]
+    fn resolve_default_repo_prefers_env_override() {
+        assert_eq!(
+            resolve_default_repo(
+                Some("/srv/writable/sherlock".to_string()),
+                Some("/home/u".to_string())
+            ),
+            PathBuf::from("/srv/writable/sherlock")
+        );
+    }
+
+    #[test]
+    fn resolve_default_repo_expands_leading_tilde_in_env() {
+        assert_eq!(
+            resolve_default_repo(
+                Some("~/scratch/sherlock".to_string()),
+                Some("/home/u".to_string())
+            ),
+            PathBuf::from("/home/u/scratch/sherlock")
+        );
+    }
+
+    #[test]
+    fn resolve_default_repo_falls_back_to_home_when_env_unset() {
+        assert_eq!(
+            resolve_default_repo(None, Some("/home/u".to_string())),
+            PathBuf::from("/home/u/.local/share/sherlock")
+        );
+    }
+
+    #[test]
+    fn resolve_default_repo_ignores_empty_env() {
+        assert_eq!(
+            resolve_default_repo(Some(String::new()), Some("/home/u".to_string())),
+            PathBuf::from("/home/u/.local/share/sherlock")
+        );
+        assert_eq!(
+            resolve_default_repo(Some("   ".to_string()), Some("/home/u".to_string())),
+            PathBuf::from("/home/u/.local/share/sherlock")
+        );
+    }
+
+    #[test]
+    fn resolve_default_repo_keeps_dot_fallback_without_home() {
+        assert_eq!(
+            resolve_default_repo(None, None),
+            PathBuf::from("./.local/share/sherlock")
+        );
+    }
+
+    #[test]
+    fn ensure_repo_usable_accepts_a_writable_dir() {
+        let root = std::env::temp_dir().join(format!("sherlock-rw-{}", Uuid::new_v4()));
+        let env = TestEnv { root };
+        ensure_repo_usable(&env.root).expect("writable temp dir should be usable");
+        assert!(env.root.is_dir(), "repo dir should have been created");
+        // The probe file must not be left behind.
+        assert!(!env.root.join(".sherlock-write-probe").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_repo_usable_names_sherlock_repo_on_readonly_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("sherlock-ro-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let original = fs::metadata(&root).expect("stat temp dir").permissions();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).expect("chmod 0555");
+
+        let result = ensure_repo_usable(&root);
+
+        // Restore permissions and clean up BEFORE asserting, so a failing
+        // assert cannot leave an unremovable directory behind.
+        let _ = fs::set_permissions(&root, original);
+        let _ = fs::remove_dir_all(&root);
+
+        match result {
+            // Running as root, or on a filesystem that ignores the mode bits —
+            // the write genuinely succeeded, so there is nothing to assert.
+            Ok(()) => {}
+            Err(err) => {
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains("SHERLOCK_REPO"),
+                    "error should suggest SHERLOCK_REPO, got: {msg}"
+                );
+                assert!(
+                    msg.contains("--repo"),
+                    "error should suggest --repo, got: {msg}"
+                );
+                assert!(
+                    msg.contains(&root.display().to_string()),
+                    "error should name the offending path, got: {msg}"
+                );
+            }
+        }
     }
 }

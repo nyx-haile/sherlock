@@ -30,6 +30,20 @@ sherlock --repo ~/.local/share/sherlock ingest --provider <id> --history <path>
 
 Omit `--provider` to let Sherlock auto-detect from the path. The command prints a JSON summary containing the `session_id` you'll need next.
 
+### If the data repo isn't writable
+
+`~/.local/share/sherlock` is only the default. On a sandboxed or read-only
+filesystem Sherlock exits immediately with an error naming the offending path.
+Relocate the repo to somewhere writable and re-run — either per command with
+`--repo <path>`, or once for the whole session:
+
+```
+export SHERLOCK_REPO=/tmp/sherlock
+```
+
+`SHERLOCK_REPO` sets the default repo for every subsequent `sherlock` call (a
+leading `~/` is expanded); an explicit `--repo` still overrides it.
+
 ## Step 3 — pull the structured report
 
 ```

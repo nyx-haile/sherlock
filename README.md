@@ -59,6 +59,26 @@ Initialize a Sherlock data repo:
 cargo run -- --repo ~/.local/share/sherlock init
 ```
 
+### Choosing where the data repo lives
+
+By default Sherlock stores its Dolt repo in `$HOME/.local/share/sherlock`. On a
+sandboxed or read-only filesystem that path may not be writable, which makes
+every command fail. Two ways to relocate it:
+
+- `--repo <path>` — per-invocation, and always wins over the environment.
+- `SHERLOCK_REPO=<path>` — sets the default for every invocation, so you don't
+  have to repeat `--repo`. A leading `~/` is expanded. Ignored if empty.
+
+```bash
+export SHERLOCK_REPO=/workspace/.sherlock
+cargo run -- init          # inits /workspace/.sherlock
+```
+
+Sherlock verifies the repo is genuinely writable at startup (creating the
+directory is not enough — `mkdir -p` succeeds on an already-existing directory
+even on a read-only mount) and, if it is not, fails immediately with a message
+naming both fixes above rather than letting Dolt fail later.
+
 Ingest agent-CLI history (auto-detects provider from the path):
 
 ```bash
