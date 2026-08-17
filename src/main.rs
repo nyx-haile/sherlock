@@ -186,6 +186,14 @@ enum Cmd {
         /// Acknowledge that the cursor adapter is experimental.
         #[arg(long, default_value_t = false)]
         experimental_cursor: bool,
+        /// Treat --history as a directory and ingest every transcript directly
+        /// inside it (non-recursive). Provider is detected per file.
+        #[arg(long, default_value_t = false)]
+        batch: bool,
+        /// Batch only: skip files whose content hash already matches the last
+        /// recorded ingest of the same path.
+        #[arg(long, default_value_t = false)]
+        skip_unchanged: bool,
         #[arg(long, default_value_t = false)]
         commit: bool,
     },
@@ -322,7 +330,7 @@ enum ReportFormat {
     Text,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct IngestSummary {
     ok: bool,
     session_id: String,
@@ -330,6 +338,50 @@ struct IngestSummary {
     turns: usize,
     sources: usize,
     windows: usize,
+}
+
+/// Per-file outcome inside a batch run. Exactly one of `error`/`session_id`
+/// is meaningful: a file that failed never got as far as an ingest.
+#[derive(Clone, Debug, Serialize)]
+struct BatchFileResult {
+    path: String,
+    provider: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    session_id: String,
+    skipped: bool,
+    events: usize,
+    turns: usize,
+    sources: usize,
+    windows: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct BatchSummary {
+    ok: bool,
+    dir: String,
+    files_discovered: usize,
+    files_ingested: usize,
+    files_skipped: usize,
+    files_failed: usize,
+    events: usize,
+    turns: usize,
+    sources: usize,
+    windows: usize,
+    files: Vec<BatchFileResult>,
+    errors: Vec<String>,
+}
+
+/// Knobs shared by every file in a batch run. Bundled rather than passed
+/// positionally so `ingest_batch` keeps a readable signature.
+struct BatchOptions<'a> {
+    provider_id: Option<&'a str>,
+    experimental_cursor: bool,
+    skip_unchanged: bool,
+    project_root: &'a Path,
+    branch: &'a str,
+    model_family: &'a str,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -560,10 +612,55 @@ fn main() -> Result<()> {
             model_family,
             provider,
             experimental_cursor,
+            batch,
+            skip_unchanged,
             commit,
         } => {
             store.init()?;
             let effective_history = resolve_history_path(history, &project_root)?;
+            let b = branch.unwrap_or_else(|| git_branch(&project_root).unwrap_or_default());
+            if batch {
+                if session_id.is_some() {
+                    return Err(anyhow!(
+                        "--session-id cannot be combined with --batch; each transcript resolves its own session id"
+                    ));
+                }
+                let opts = BatchOptions {
+                    provider_id: provider.as_deref(),
+                    experimental_cursor,
+                    skip_unchanged,
+                    project_root: &project_root,
+                    branch: &b,
+                    model_family: &model_family,
+                };
+                let summary = ingest_batch(&store, &effective_history, &opts)?;
+                if commit {
+                    store.commit(&format!(
+                        "sherlock: batch ingest {} files={} events={}",
+                        effective_history.display(),
+                        summary.files_ingested,
+                        summary.events
+                    ))?;
+                }
+                println!("{}", serde_json::to_string(&summary)?);
+                // Partial failure is still a failure for CI callers; the JSON
+                // above carries the per-file detail either way.
+                if !summary.ok {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            if skip_unchanged {
+                return Err(anyhow!("--skip-unchanged only applies to --batch runs"));
+            }
+            // A directory used to sail through here and "succeed" with zero
+            // events, because ingest read the path with unwrap_or_default().
+            if effective_history.is_dir() {
+                return Err(anyhow!(
+                    "{} is a directory; pass --batch to ingest every transcript inside it",
+                    effective_history.display()
+                ));
+            }
             let provider_box: Box<dyn Provider> = match provider.as_deref() {
                 Some(id) => providers::by_id(id)
                     .ok_or_else(|| anyhow!("unknown provider: {id}"))?,
@@ -578,7 +675,6 @@ fn main() -> Result<()> {
                 eprintln!("⚠️  {}", warning);
             }
             let sid = resolve_ingest_session_id(&*provider_box, &effective_history, session_id)?;
-            let b = branch.unwrap_or_else(|| git_branch(&project_root).unwrap_or_default());
             let summary = ingest_session(
                 &store,
                 &*provider_box,
@@ -966,6 +1062,154 @@ fn discover_subagent_files(main_history: &Path) -> Vec<(PathBuf, Option<String>)
     out
 }
 
+/// The sha256 recorded for the last successful ingest of `path`, if any.
+/// Used by `--skip-unchanged` so re-running a batch over a projects directory
+/// only touches transcripts that actually moved.
+fn last_ingested_sha(store: &SherlockStore, path: &Path) -> Result<Option<String>> {
+    let rows = store.query_rows(&format!(
+        "SELECT sha256 FROM artifacts WHERE artifact_type='history_jsonl' AND path_or_key='{}' \
+         ORDER BY captured_at DESC LIMIT 1",
+        sql(&path.display().to_string())
+    ))?;
+    Ok(rows
+        .first()
+        .map(|row| get_str(row, "sha256"))
+        .filter(|sha| !sha.is_empty()))
+}
+
+/// Ingest every transcript directly inside `dir`.
+///
+/// One bad file must not sink the run — a projects directory routinely holds
+/// half-written or foreign-format JSONL — so per-file errors are collected and
+/// reported in the summary instead of aborting on the first failure. The run
+/// as a whole is still reported as `ok: false` when anything failed.
+fn ingest_batch(store: &SherlockStore, dir: &Path, opts: &BatchOptions) -> Result<BatchSummary> {
+    if !dir.is_dir() {
+        return Err(anyhow!(
+            "--batch expects a directory, but {} is not one",
+            dir.display()
+        ));
+    }
+    let paths = history_files_in_dir(dir)?;
+    let mut summary = BatchSummary {
+        ok: true,
+        dir: dir.display().to_string(),
+        files_discovered: paths.len(),
+        files_ingested: 0,
+        files_skipped: 0,
+        files_failed: 0,
+        events: 0,
+        turns: 0,
+        sources: 0,
+        windows: 0,
+        files: Vec::new(),
+        errors: Vec::new(),
+    };
+    let mut warned_providers = std::collections::HashSet::<&'static str>::new();
+
+    for path in paths {
+        match ingest_one_in_batch(store, &path, opts, &mut warned_providers) {
+            Ok(result) => {
+                if result.skipped {
+                    summary.files_skipped += 1;
+                } else {
+                    summary.files_ingested += 1;
+                    summary.events += result.events;
+                    summary.turns += result.turns;
+                    summary.sources += result.sources;
+                    summary.windows += result.windows;
+                }
+                summary.files.push(result);
+            }
+            Err(err) => {
+                summary.ok = false;
+                summary.files_failed += 1;
+                let message = format!("{}: {:#}", path.display(), err);
+                summary.errors.push(message.clone());
+                summary.files.push(BatchFileResult {
+                    path: path.display().to_string(),
+                    provider: String::new(),
+                    session_id: String::new(),
+                    skipped: false,
+                    events: 0,
+                    turns: 0,
+                    sources: 0,
+                    windows: 0,
+                    error: Some(message),
+                });
+            }
+        }
+    }
+    Ok(summary)
+}
+
+fn ingest_one_in_batch(
+    store: &SherlockStore,
+    path: &Path,
+    opts: &BatchOptions,
+    warned_providers: &mut std::collections::HashSet<&'static str>,
+) -> Result<BatchFileResult> {
+    // Provider detection is per file: a projects directory can hold Claude
+    // Code, Codex and Copilot transcripts side by side.
+    let provider_box: Box<dyn Provider> = match opts.provider_id {
+        Some(id) => providers::by_id(id).ok_or_else(|| anyhow!("unknown provider: {id}"))?,
+        None => providers::detect_provider(path),
+    };
+    if provider_box.id() == "cursor" && !opts.experimental_cursor {
+        return Err(anyhow!(
+            "cursor adapter is experimental; re-run with --experimental-cursor to acknowledge"
+        ));
+    }
+    // Shaky adapters warn once per batch, not once per file.
+    match provider_box.instability_warning() {
+        Some(warning) if warned_providers.insert(provider_box.id()) => {
+            eprintln!("⚠️  {}", warning);
+        }
+        _ => {}
+    }
+
+    if opts.skip_unchanged {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("read history file {}", path.display()))?;
+        let previous = last_ingested_sha(store, path)?;
+        if previous.as_deref() == Some(sha256_hex(&raw).as_str()) {
+            return Ok(BatchFileResult {
+                path: path.display().to_string(),
+                provider: provider_box.id().to_string(),
+                session_id: String::new(),
+                skipped: true,
+                events: 0,
+                turns: 0,
+                sources: 0,
+                windows: 0,
+                error: None,
+            });
+        }
+    }
+
+    let sid = resolve_ingest_session_id(&*provider_box, path, None)?;
+    let summary = ingest_session(
+        store,
+        &*provider_box,
+        path,
+        &sid,
+        opts.project_root,
+        opts.branch,
+        opts.model_family,
+    )?;
+    Ok(BatchFileResult {
+        path: path.display().to_string(),
+        provider: provider_box.id().to_string(),
+        session_id: summary.session_id,
+        skipped: false,
+        events: summary.events,
+        turns: summary.turns,
+        sources: summary.sources,
+        windows: summary.windows,
+        error: None,
+    })
+}
+
 fn ingest_session(
     store: &SherlockStore,
     provider: &dyn Provider,
@@ -976,7 +1220,12 @@ fn ingest_session(
     model_family: &str,
 ) -> Result<IngestSummary> {
     let started_at = iso_now();
-    let main_raw = fs::read_to_string(history_path).unwrap_or_default();
+    // Hard error, not unwrap_or_default(): swallowing this is what let
+    // `sherlock ingest --history <dir>` report a successful ingest of zero
+    // events (sherlock-4pz). Subagent sidechains below stay best-effort —
+    // those are discovered, not user-specified.
+    let main_raw = fs::read_to_string(history_path)
+        .with_context(|| format!("read history file {}", history_path.display()))?;
     let main_artifact_id = short_id("artifact");
 
     let mut files: Vec<IngestFile> = vec![IngestFile {
@@ -2751,6 +3000,41 @@ fn resolve_history_path(provided: Option<PathBuf>, project_root: &Path) -> Resul
     Ok(default_history())
 }
 
+/// Every transcript file sitting directly inside `dir`, sorted so a batch run
+/// is deterministic.
+///
+/// Deliberately non-recursive. Claude Code parks subagent sidechains under
+/// `<stem>/subagents/`, and `discover_subagent_files` already pulls those in
+/// alongside their parent transcript — descending here would ingest the same
+/// events a second time under a synthesized session id.
+fn history_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries =
+        fs::read_dir(dir).with_context(|| format!("read history directory {}", dir.display()))?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read directory entry in {}", dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        // Belt and braces: a caller could hand us a `subagents/` dir directly.
+        if path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some("subagents")
+        {
+            continue;
+        }
+        out.push(path);
+    }
+    out.sort();
+    Ok(out)
+}
+
 fn latest_project_session_file(project_root: &Path) -> Option<PathBuf> {
     let dir = default_projects_root().join(project_key(project_root));
     latest_jsonl_in_dir(&dir)
@@ -4144,6 +4428,200 @@ mod tests {
         assert!(markdown.contains("Cache reads dominate session spend."));
         assert!(text.contains("Recommendations:"));
         assert!(text.contains("Reduce context rehydration between turns."));
+    }
+
+    /// Lay out a directory that looks like a real Claude Code projects dir:
+    /// two top-level transcripts, a non-transcript file, and a subagent
+    /// sidechain nested under `<stem>/subagents/`.
+    fn setup_batch_dir(root: &Path) -> PathBuf {
+        let dir = root.join("batch");
+        fs::create_dir_all(&dir).expect("create batch dir");
+        for name in ["short_clean.jsonl", "cache_read_heavy.jsonl"] {
+            fs::copy(fixture_path(name), dir.join(name)).expect("copy fixture");
+        }
+        fs::write(dir.join("notes.txt"), "not a transcript").expect("write notes");
+        let sub = dir.join("short_clean").join("subagents");
+        fs::create_dir_all(&sub).expect("create subagents dir");
+        fs::copy(
+            fixture_path("subagent_basic/subagents/agent-explore1.jsonl"),
+            sub.join("agent-explore1.jsonl"),
+        )
+        .expect("copy subagent fixture");
+        dir
+    }
+
+    #[test]
+    fn history_files_in_dir_is_non_recursive_and_skips_subagents() {
+        let root = std::env::temp_dir().join(format!("sherlock-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp root");
+        let env = TestEnv { root };
+        let dir = setup_batch_dir(&env.root);
+
+        let found = history_files_in_dir(&dir).expect("list history files");
+        let names = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        // Sorted, .jsonl only, and the nested subagents/ sidechain stays out —
+        // ingest_session discovers those per parent transcript already.
+        assert_eq!(names, vec!["cache_read_heavy.jsonl", "short_clean.jsonl"]);
+
+        // Pointed straight at a subagents dir, it still refuses.
+        let sub = dir.join("short_clean").join("subagents");
+        assert!(
+            history_files_in_dir(&sub)
+                .expect("list subagents dir")
+                .is_empty()
+        );
+
+        assert!(history_files_in_dir(&env.root.join("missing")).is_err());
+    }
+
+    #[test]
+    fn ingest_session_errors_on_unreadable_history() {
+        let root = std::env::temp_dir().join(format!("sherlock-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp root");
+        let env = TestEnv { root };
+        // No dolt init needed: both cases fail before any SQL is emitted.
+        let store = SherlockStore::new(env.root.join("repo"));
+        let provider = providers::claude_code::ClaudeCodeProvider;
+
+        let missing = env.root.join("does-not-exist.jsonl");
+        let err = ingest_session(&store, &provider, &missing, "s", &env.root, "main", "")
+            .expect_err("missing history must error");
+        assert!(
+            format!("{err:#}").contains("read history file"),
+            "unexpected error: {err:#}"
+        );
+
+        // The sherlock-4pz defect: a directory used to read as an empty string
+        // and report a successful ingest of zero events.
+        let dir = env.root.join("as-a-dir");
+        fs::create_dir_all(&dir).expect("create dir");
+        let err = ingest_session(&store, &provider, &dir, "s", &env.root, "main", "")
+            .expect_err("directory history must error");
+        assert!(
+            format!("{err:#}").contains("read history file"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn batch_ingest_walks_a_folder_and_skips_unchanged_on_rerun() {
+        let (temp, store) = setup_store();
+        let dir = setup_batch_dir(&temp.root);
+        let project_root = PathBuf::from("/tmp/project-alpha");
+        let opts = BatchOptions {
+            provider_id: None,
+            experimental_cursor: false,
+            skip_unchanged: false,
+            project_root: &project_root,
+            branch: "main",
+            model_family: "claude-sonnet",
+        };
+
+        let summary = ingest_batch(&store, &dir, &opts).expect("batch ingest");
+        assert!(summary.ok, "errors: {:?}", summary.errors);
+        assert_eq!(summary.files_discovered, 2);
+        assert_eq!(summary.files_ingested, 2);
+        assert_eq!(summary.files_skipped, 0);
+        assert_eq!(summary.files_failed, 0);
+        assert!(summary.events > 0);
+        // Provider detection happens per file, not once for the directory.
+        assert!(summary.files.iter().all(|f| f.provider == "claude-code"));
+        let session_ids = summary
+            .files
+            .iter()
+            .map(|f| f.session_id.clone())
+            .collect::<Vec<_>>();
+        assert!(session_ids.contains(&"short-clean".to_string()));
+        assert!(session_ids.contains(&"cache-read-heavy".to_string()));
+        // The subagent sidechain came in attached to its parent transcript.
+        let report = summarize_session(&store, "short-clean").expect("summarize");
+        assert_eq!(get_str(&report, "session_id"), "short-clean");
+
+        let rerun_opts = BatchOptions {
+            skip_unchanged: true,
+            ..opts
+        };
+        let rerun = ingest_batch(&store, &dir, &rerun_opts).expect("batch rerun");
+        assert!(rerun.ok, "errors: {:?}", rerun.errors);
+        assert_eq!(rerun.files_skipped, 2);
+        assert_eq!(rerun.files_ingested, 0);
+        assert_eq!(rerun.events, 0);
+
+        // Touching one transcript brings just that file back into the run.
+        let changed = dir.join("short_clean.jsonl");
+        let mut raw = fs::read_to_string(&changed).expect("read fixture copy");
+        raw.push('\n');
+        fs::write(&changed, raw).expect("rewrite fixture copy");
+        let partial = ingest_batch(&store, &dir, &rerun_opts).expect("batch rerun after edit");
+        assert_eq!(partial.files_ingested, 1);
+        assert_eq!(partial.files_skipped, 1);
+    }
+
+    #[test]
+    fn batch_ingest_accumulates_errors_instead_of_aborting() {
+        let (temp, store) = setup_store();
+        let dir = setup_batch_dir(&temp.root);
+        // Cursor detection is path-based; this name scores higher than the
+        // claude-code content sniff, so the file trips the experimental gate.
+        fs::copy(
+            fixture_path("short_clean.jsonl"),
+            dir.join("cursor-export-demo.jsonl"),
+        )
+        .expect("copy cursor-named fixture");
+        let project_root = PathBuf::from("/tmp/project-alpha");
+        let opts = BatchOptions {
+            provider_id: None,
+            experimental_cursor: false,
+            skip_unchanged: false,
+            project_root: &project_root,
+            branch: "main",
+            model_family: "claude-sonnet",
+        };
+
+        let summary = ingest_batch(&store, &dir, &opts).expect("batch ingest");
+        assert!(!summary.ok);
+        assert_eq!(summary.files_discovered, 3);
+        assert_eq!(summary.files_failed, 1);
+        // The failure did not abort the run — the other two still landed.
+        assert_eq!(summary.files_ingested, 2);
+        assert_eq!(summary.errors.len(), 1);
+        assert!(
+            summary.errors[0].contains("cursor-export-demo.jsonl")
+                && summary.errors[0].contains("experimental"),
+            "unexpected error text: {:?}",
+            summary.errors
+        );
+
+        // Every file gets a row in the summary, failures included.
+        assert_eq!(summary.files.len(), 3);
+        assert_eq!(
+            summary.files.iter().filter(|f| f.error.is_some()).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn batch_ingest_rejects_a_file_path() {
+        let (temp, store) = setup_store();
+        let dir = setup_batch_dir(&temp.root);
+        let project_root = PathBuf::from("/tmp/project-alpha");
+        let opts = BatchOptions {
+            provider_id: None,
+            experimental_cursor: false,
+            skip_unchanged: false,
+            project_root: &project_root,
+            branch: "main",
+            model_family: "claude-sonnet",
+        };
+        let err = ingest_batch(&store, &dir.join("short_clean.jsonl"), &opts)
+            .expect_err("a file is not a batch root");
+        assert!(
+            format!("{err:#}").contains("expects a directory"),
+            "{err:#}"
+        );
     }
 
     #[test]
