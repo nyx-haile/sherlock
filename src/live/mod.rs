@@ -4,3 +4,4 @@
 //! Modules here poll authenticated endpoints and never persist tokens.
 
 pub mod claude_code_oauth;
+pub mod reconcile;

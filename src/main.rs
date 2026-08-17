@@ -1,6 +1,7 @@
 mod analyze;
 mod install_skill;
 mod live;
+mod pricing;
 mod providers;
 
 use anyhow::{anyhow, Context, Result};
@@ -311,6 +312,30 @@ enum Cmd {
         /// Override cache TTL in seconds.
         #[arg(long, default_value_t = 60)]
         cache_ttl: u64,
+    },
+    /// Cross-check the live OAuth 7-day utilization against transcript-derived
+    /// token spend. The two share only the 7-day window, so without
+    /// `--plan-budget-usd` both figures are reported raw rather than combined
+    /// into a ratio Sherlock would have to invent a denominator for.
+    Reconcile {
+        /// Source. Only `claude-code` is wired up today.
+        #[arg(long, default_value = "claude-code")]
+        provider: String,
+        /// Your plan's 7-day spend allowance in USD. Supplying it turns the
+        /// OAuth utilization percentage into a dollar figure to compare.
+        #[arg(long)]
+        plan_budget_usd: Option<f64>,
+        /// Window to sum transcripts over. Must match the OAuth window (7d).
+        #[arg(long, default_value = "7d")]
+        since: String,
+        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+        format: ReportFormat,
+        /// Bypass the 60s quota cache and hit the API every time.
+        #[arg(long, default_value_t = false)]
+        no_cache: bool,
+        /// Override credentials path (default: ~/.claude/.credentials.json).
+        #[arg(long)]
+        credentials: Option<PathBuf>,
     },
     /// Install the bundled Claude Code skill into ~/.claude/skills.
     InstallSkill {
@@ -877,6 +902,43 @@ fn main() -> Result<()> {
             let snapshot = live::claude_code_oauth::fetch_quota(&opts)?;
             let rendered = render_quota(&snapshot, format)?;
             println!("{rendered}");
+        }
+        Cmd::Reconcile {
+            provider,
+            plan_budget_usd,
+            since,
+            format,
+            no_cache,
+            credentials,
+        } => {
+            if provider != "claude-code" {
+                return Err(anyhow!(
+                    "reconcile: only provider `claude-code` is supported today (got `{}`)",
+                    provider
+                ));
+            }
+            // Rejects NaN/inf as well as zero and negatives: a non-finite
+            // budget would silently fall through to "not comparable".
+            if plan_budget_usd.is_some_and(|budget| !budget.is_finite() || budget <= 0.0) {
+                return Err(anyhow!("--plan-budget-usd must be a positive number"));
+            }
+            let (since_iso, since_epoch) = parse_since_expr(&since)?;
+            let mut opts = live::claude_code_oauth::FetchOptions::defaults()?;
+            if let Some(path) = credentials {
+                opts.credentials_path = path;
+            }
+            opts.use_cache = !no_cache;
+            let snapshot = live::claude_code_oauth::fetch_quota(&opts)?;
+
+            let provider_box = providers::by_id("claude-code")
+                .ok_or_else(|| anyhow!("claude-code provider is not registered"))?;
+            let files =
+                live::reconcile::history_files_since(&default_projects_root(), since_epoch)?;
+            let estimate =
+                live::reconcile::estimate_since(&*provider_box, &files, since_epoch, &since_iso)?;
+            let report =
+                live::reconcile::reconcile(&snapshot, estimate, plan_budget_usd, iso_now());
+            println!("{}", render_reconcile(&report, format)?);
         }
         Cmd::InstallSkill { dest, force } => {
             let target = match dest {
@@ -3984,6 +4046,157 @@ fn render_headline_markdown(report: &Value) -> Result<String> {
     Ok(out)
 }
 
+fn render_reconcile(
+    report: &live::reconcile::Reconciliation,
+    format: ReportFormat,
+) -> Result<String> {
+    match format {
+        ReportFormat::Json => Ok(serde_json::to_string_pretty(report)?),
+        ReportFormat::Markdown => render_reconcile_markdown(report),
+        ReportFormat::Text => render_reconcile_text(report),
+    }
+}
+
+/// Both sides are always printed as themselves — a utilization percentage and
+/// a USD figure. The derived comparison only appears when the operator gave a
+/// plan budget; otherwise the reader gets the raw pair and the reason.
+fn render_reconcile_text(report: &live::reconcile::Reconciliation) -> Result<String> {
+    let mut out = String::new();
+    writeln!(
+        &mut out,
+        "Reconcile {} over {} (generated {})",
+        report.provider, report.window, report.generated_at
+    )?;
+    match report.oauth.seven_day_utilization_pct {
+        Some(pct) => writeln!(
+            &mut out,
+            "OAuth 7d utilization: {:.1}%{}{}",
+            pct,
+            report
+                .oauth
+                .resets_at
+                .as_ref()
+                .map(|r| format!(" (resets {r})"))
+                .unwrap_or_default(),
+            if report.oauth.cached { " [cached]" } else { "" }
+        )?,
+        None => writeln!(&mut out, "OAuth 7d utilization: unavailable")?,
+    }
+    let t = &report.transcripts;
+    writeln!(
+        &mut out,
+        "Transcripts since {}: ${:.2} list price over {} tokens ({} events, {} file(s))",
+        t.since, t.estimated_cost_usd, t.total_tokens, t.events_counted, t.files_scanned
+    )?;
+    for spend in &t.per_model {
+        writeln!(
+            &mut out,
+            "  {}: {}",
+            spend.model,
+            match spend.estimated_cost_usd {
+                Some(cost) => format!("${cost:.2}"),
+                None => "unpriced".to_string(),
+            }
+        )?;
+    }
+
+    let c = &report.comparison;
+    writeln!(&mut out, "\nComparison [{}]: {}", c.verdict, c.note)?;
+    if let (Some(budget), Some(implied), Some(delta)) =
+        (c.plan_budget_usd, c.oauth_implied_usd, c.delta_usd)
+    {
+        writeln!(
+            &mut out,
+            "  plan budget ${budget:.2} -> OAuth implies ${implied:.2}; transcripts ${:.2}; delta ${delta:+.2}{}",
+            t.estimated_cost_usd,
+            c.delta_pct
+                .map(|pct| format!(" ({pct:+.1}%)"))
+                .unwrap_or_default()
+        )?;
+    }
+
+    if !report.caveats.is_empty() {
+        writeln!(&mut out, "\nCaveats:")?;
+        for caveat in &report.caveats {
+            writeln!(&mut out, "- {caveat}")?;
+        }
+    }
+    Ok(out.trim_end().to_string())
+}
+
+fn render_reconcile_markdown(report: &live::reconcile::Reconciliation) -> Result<String> {
+    let mut out = String::new();
+    writeln!(&mut out, "# Sherlock Reconcile ({})", report.window)?;
+    writeln!(
+        &mut out,
+        "\nProvider `{}`, generated {}.",
+        report.provider, report.generated_at
+    )?;
+    writeln!(&mut out, "\n## The two sides")?;
+    writeln!(&mut out, "\n| Source | Figure |")?;
+    writeln!(&mut out, "| --- | --- |")?;
+    writeln!(
+        &mut out,
+        "| OAuth 7d utilization | {} |",
+        match report.oauth.seven_day_utilization_pct {
+            Some(pct) => format!("{pct:.1}%"),
+            None => "unavailable".to_string(),
+        }
+    )?;
+    let t = &report.transcripts;
+    writeln!(
+        &mut out,
+        "| Transcript list-price spend | ${:.2} ({} tokens) |",
+        t.estimated_cost_usd, t.total_tokens
+    )?;
+
+    if !t.per_model.is_empty() {
+        writeln!(&mut out, "\n## Per model")?;
+        writeln!(&mut out, "\n| Model | Tokens | List price |")?;
+        writeln!(&mut out, "| --- | --- | --- |")?;
+        for spend in &t.per_model {
+            let tokens = spend.input_tokens
+                + spend.output_tokens
+                + spend.cache_read_tokens
+                + spend.cache_write_tokens;
+            writeln!(
+                &mut out,
+                "| `{}` | {} | {} |",
+                spend.model,
+                tokens,
+                match spend.estimated_cost_usd {
+                    Some(cost) => format!("${cost:.2}"),
+                    None => "unpriced".to_string(),
+                }
+            )?;
+        }
+    }
+
+    let c = &report.comparison;
+    writeln!(&mut out, "\n## Comparison")?;
+    writeln!(&mut out, "\n**{}** — {}", c.verdict, c.note)?;
+    if let (Some(budget), Some(implied), Some(delta)) =
+        (c.plan_budget_usd, c.oauth_implied_usd, c.delta_usd)
+    {
+        writeln!(
+            &mut out,
+            "\nPlan budget **${budget:.2}** implies **${implied:.2}** of OAuth spend; transcripts account for **${:.2}** (delta **${delta:+.2}**{}).",
+            t.estimated_cost_usd,
+            c.delta_pct
+                .map(|pct| format!(", {pct:+.1}%"))
+                .unwrap_or_default()
+        )?;
+    }
+
+    if !report.caveats.is_empty() {
+        writeln!(&mut out, "\n## Caveats")?;
+        for caveat in &report.caveats {
+            writeln!(&mut out, "- {caveat}")?;
+        }
+    }
+    Ok(out.trim_end().to_string())
+}
+
 fn render_quota(snapshot: &live::claude_code_oauth::QuotaSnapshot, format: ReportFormat) -> Result<String> {
     match format {
         ReportFormat::Json => Ok(serde_json::to_string_pretty(snapshot)?),
@@ -4697,6 +4910,182 @@ mod tests {
         let facts = thinking_facts(&store, &provider, "thinking-blocks").expect("thinking facts");
         assert!(!facts.supported);
         assert_eq!(facts.turns_with_thinking, 0);
+    }
+
+    /// A quota snapshot with a known 7-day utilization, for reconcile tests.
+    fn quota_snapshot_with_seven_day(utilization: f64) -> live::claude_code_oauth::QuotaSnapshot {
+        live::claude_code_oauth::QuotaSnapshot {
+            provider: "claude-code".to_string(),
+            fetched_at: "2026-08-17T00:00:00Z".to_string(),
+            cached: false,
+            cache_age_secs: None,
+            subscription_type: Some("max".to_string()),
+            rate_limit_tier: Some("default_claude_max_5x".to_string()),
+            five_hour: None,
+            seven_day: Some(live::claude_code_oauth::QuotaWindow {
+                utilization,
+                resets_at: Some("2026-08-20T00:00:00Z".to_string()),
+            }),
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            seven_day_cowork: None,
+            seven_day_oauth_apps: None,
+            seven_day_omelette: None,
+            extra_usage: None,
+            raw: json!({}),
+        }
+    }
+
+    fn reconcile_fixture_estimate() -> live::reconcile::TranscriptEstimate {
+        let provider = providers::claude_code::ClaudeCodeProvider;
+        let since_epoch = parse_ts_epoch("2026-08-10T00:00:00Z").expect("parse since");
+        live::reconcile::estimate_since(
+            &provider,
+            &[fixture_path("reconcile_window.jsonl")],
+            since_epoch,
+            "2026-08-10T00:00:00Z",
+        )
+        .expect("estimate")
+    }
+
+    #[test]
+    fn extract_model_reads_the_assistant_message_envelope() {
+        let provider = providers::claude_code::ClaudeCodeProvider;
+        let ev = RawEvent::Json(json!({"message": {"model": "claude-opus-4-6"}}));
+        assert_eq!(
+            provider.extract_model(&ev),
+            Some("claude-opus-4-6".to_string())
+        );
+        // Falls back to a top-level `model`, and treats empty as absent.
+        let ev = RawEvent::Json(json!({"model": "claude-sonnet-5"}));
+        assert_eq!(
+            provider.extract_model(&ev),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            provider.extract_model(&RawEvent::Json(json!({"message": {"model": ""}}))),
+            None
+        );
+        assert_eq!(provider.extract_model(&RawEvent::Json(json!({}))), None);
+    }
+
+    #[test]
+    fn estimate_since_prices_per_model_and_drops_out_of_window_events() {
+        let est = reconcile_fixture_estimate();
+
+        // Three in-window events carry usage; the January event and the
+        // usage-free user turn are both excluded.
+        assert_eq!(est.events_counted, 3);
+        assert_eq!(est.input_tokens, 2_000_000);
+        assert_eq!(est.output_tokens, 1_000_000);
+        assert_eq!(est.total_tokens, 3_000_000);
+
+        // 1M sonnet-5 input ($3) + 1M opus-4-6 output ($25). The unpriced
+        // model's tokens are counted but contribute nothing.
+        assert!(
+            (est.estimated_cost_usd - 28.0).abs() < 1e-9,
+            "got {}",
+            est.estimated_cost_usd
+        );
+        assert_eq!(est.unpriced_models, vec!["experimental-unpriced-model"]);
+        assert_eq!(est.per_model.len(), 3);
+        // Sorted by cost, so the opus turn leads.
+        assert_eq!(est.per_model[0].model, "claude-opus-4-6");
+        assert_eq!(est.per_model[0].estimated_cost_usd, Some(25.0));
+        assert!(
+            est.per_model
+                .iter()
+                .any(|m| m.model == "experimental-unpriced-model"
+                    && m.estimated_cost_usd.is_none())
+        );
+    }
+
+    #[test]
+    fn reconcile_without_a_budget_reports_both_raw_numbers() {
+        let snapshot = quota_snapshot_with_seven_day(50.0);
+        let report = live::reconcile::reconcile(
+            &snapshot,
+            reconcile_fixture_estimate(),
+            None,
+            "2026-08-17T00:00:00Z".to_string(),
+        );
+
+        // The whole point of sherlock-h4u: a utilization percentage and a USD
+        // figure share only a window, so no ratio is invented.
+        assert_eq!(report.comparison.verdict, "not-comparable");
+        assert_eq!(report.comparison.oauth_implied_usd, None);
+        assert_eq!(report.comparison.delta_usd, None);
+        assert_eq!(report.comparison.delta_pct, None);
+        assert!(
+            report.comparison.note.contains("plan-budget-usd"),
+            "note should name the missing input: {}",
+            report.comparison.note
+        );
+        // Both raw sides survive.
+        assert_eq!(report.oauth.seven_day_utilization_pct, Some(50.0));
+        assert!((report.transcripts.estimated_cost_usd - 28.0).abs() < 1e-9);
+        assert!(!report.caveats.is_empty());
+        assert!(
+            report
+                .caveats
+                .iter()
+                .any(|c| c.contains("only history files on this machine"))
+        );
+
+        let text = render_reconcile_text(&report).expect("text");
+        assert!(text.contains("OAuth 7d utilization: 50.0%"));
+        assert!(text.contains("$28.00"));
+        assert!(text.contains("[not-comparable]"));
+    }
+
+    #[test]
+    fn reconcile_with_a_budget_flags_divergence() {
+        let snapshot = quota_snapshot_with_seven_day(50.0);
+
+        // Budget $56 => OAuth implies $28, matching the transcripts exactly.
+        let aligned = live::reconcile::reconcile(
+            &snapshot,
+            reconcile_fixture_estimate(),
+            Some(56.0),
+            "2026-08-17T00:00:00Z".to_string(),
+        );
+        assert_eq!(aligned.comparison.verdict, "aligned");
+        assert_eq!(aligned.comparison.oauth_implied_usd, Some(28.0));
+        assert!(aligned.comparison.delta_usd.unwrap().abs() < 1e-9);
+
+        // Budget $100 => OAuth implies $50 against $28 of transcripts: the
+        // transcripts under-account by 44%.
+        let diverged = live::reconcile::reconcile(
+            &snapshot,
+            reconcile_fixture_estimate(),
+            Some(100.0),
+            "2026-08-17T00:00:00Z".to_string(),
+        );
+        assert_eq!(diverged.comparison.verdict, "transcripts-under");
+        assert_eq!(diverged.comparison.oauth_implied_usd, Some(50.0));
+        assert!((diverged.comparison.delta_usd.unwrap() + 22.0).abs() < 1e-9);
+        assert!((diverged.comparison.delta_pct.unwrap() + 44.0).abs() < 1e-9);
+
+        let markdown = render_reconcile(&diverged, ReportFormat::Markdown)
+            .expect("reconcile markdown");
+        assert!(markdown.contains("# Sherlock Reconcile (7d)"));
+        assert!(markdown.contains("| OAuth 7d utilization | 50.0% |"));
+        assert!(markdown.contains("**transcripts-under**"));
+        assert!(markdown.contains("## Caveats"));
+    }
+
+    #[test]
+    fn reconcile_is_not_comparable_without_a_seven_day_window() {
+        let mut snapshot = quota_snapshot_with_seven_day(50.0);
+        snapshot.seven_day = None;
+        let report = live::reconcile::reconcile(
+            &snapshot,
+            reconcile_fixture_estimate(),
+            Some(100.0),
+            "2026-08-17T00:00:00Z".to_string(),
+        );
+        assert_eq!(report.comparison.verdict, "not-comparable");
+        assert!(report.comparison.note.contains("seven_day"));
     }
 
     #[test]

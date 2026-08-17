@@ -46,6 +46,13 @@ pub trait Provider: Send + Sync {
 
     fn extract_session_id(&self, ev: &RawEvent) -> Option<String>;
     fn extract_usage(&self, ev: &RawEvent) -> UsageSample;
+    /// Model id this event was billed against, when the transcript records
+    /// one. Needed to price token counts — rates differ per model, so a
+    /// spend estimate that ignores this is only meaningful on a
+    /// single-model session.
+    fn extract_model(&self, _ev: &RawEvent) -> Option<String> {
+        None
+    }
     fn extract_tool_name(&self, ev: &RawEvent) -> String;
     fn extract_plugin_id(&self, ev: &RawEvent, tool: &str) -> Option<String>;
     fn extract_mcp_server_name(&self, tool: &str) -> Option<String>;

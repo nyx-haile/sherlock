@@ -104,6 +104,17 @@ impl Provider for ClaudeCodeProvider {
         }
     }
 
+    /// Claude Code stamps the model on the assistant message envelope.
+    fn extract_model(&self, ev: &RawEvent) -> Option<String> {
+        let obj = ev.as_json()?;
+        obj.get("message")
+            .and_then(|m| m.get("model"))
+            .or_else(|| obj.get("model"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+
     fn extract_tool_name(&self, ev: &RawEvent) -> String {
         let Some(obj) = ev.as_json() else {
             return String::new();
